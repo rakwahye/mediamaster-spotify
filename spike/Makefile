@@ -4,17 +4,19 @@
 
 LRC  := ../librespot-c
 PKGS := libevent json-c libgcrypt libcurl libprotobuf-c
+
+# Fetch the submodule before the source list below is expanded.
+ifeq ($(wildcard $(LRC)/librespot-c.h),)
+$(shell git -C .. submodule update --init librespot-c >&2)
+endif
 SRC  := spike.c $(wildcard $(LRC)/src/*.c $(LRC)/src/proto/*.c $(LRC)/src/shannon/*.c)
 
 CFLAGS ?= -O2 -g
 CFLAGS += -pthread -D_GNU_SOURCE -I$(LRC) -I$(LRC)/src $(shell pkg-config --cflags $(PKGS))
 LDLIBS += $(shell pkg-config --libs $(PKGS)) -pthread
 
-spike: $(SRC) $(LRC)/librespot-c.h
+spike: $(SRC)
 	$(CC) $(CFLAGS) $(SRC) $(LDLIBS) -o $@
-
-$(LRC)/librespot-c.h:
-	git -C .. submodule update --init librespot-c
 
 clean:
 	rm -f spike
