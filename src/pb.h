@@ -36,4 +36,15 @@ int pb_next(struct pb *r, struct pb_field *f);
 /** A length-delimited field as a NUL-terminated copy (truncated to fit). */
 void pb_str(const struct pb_field *f, char *out, size_t cap);
 
+/* ---- write side, for small requests ---- */
+
+struct pbw {
+	uint8_t b[2048];
+	size_t n;
+	int over; /* something did not fit: do not send */
+};
+
+void pbw_varint(struct pbw *w, uint32_t num, uint64_t v);
+void pbw_str(struct pbw *w, uint32_t num, const char *s); /* skipped when empty, as proto3 does */
+
 #endif

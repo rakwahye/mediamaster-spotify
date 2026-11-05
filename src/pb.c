@@ -60,3 +60,36 @@ void pb_str(const struct pb_field *f, char *out, size_t cap)
 	memcpy(out, f->data, n);
 	out[n] = '\0';
 }
+
+static void put_varint(struct pbw *w, uint64_t v)
+{
+	do {
+		if (w->n == sizeof(w->b)) {
+			w->over = 1;
+			return;
+		}
+		uint8_t c = (uint8_t)(v & 0x7f);
+		v >>= 7;
+		w->b[w->n++] = (uint8_t)(c | (v ? 0x80 : 0));
+	} while (v);
+}
+
+void pbw_varint(struct pbw *w, uint32_t num, uint64_t v)
+{
+	put_varint(w, (uint64_t)num << 3);
+	put_varint(w, v);
+}
+
+void pbw_str(struct pbw *w, uint32_t num, const char *s)
+{
+	size_t len = strlen(s);
+	if (!len) return;
+	put_varint(w, (uint64_t)num << 3 | 2);
+	put_varint(w, len);
+	if (sizeof(w->b) - w->n < len) {
+		w->over = 1;
+		return;
+	}
+	memcpy(w->b + w->n, s, len);
+	w->n += len;
+}

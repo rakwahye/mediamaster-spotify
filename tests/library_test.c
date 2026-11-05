@@ -189,17 +189,89 @@ static int batch(void)
 	uint8_t *body = malloc(len);
 	spotify__extendedmetadata__batched_extension_response__pack(&res, body);
 
-	CHECK(lib_parse_batch(body, len, &t) == 0, "parses");
+	CHECK(lib_parse_batch(body, len, LIB_TRACK, &t) == 0, "parses");
 	CHECK(!t.v[0].title, "no entry: untitled");
 	CHECK(t.v[1].title && !strcmp(t.v[1].title, "Song B") && !strcmp(t.v[1].artist, "One, Two") &&
 	      !strcmp(t.v[1].album, "LP") && t.v[1].duration_ms == 201000, "titled from its Track");
 	CHECK(!t.v[2].title, "a 404 entry is skipped");
 	static const uint8_t junk[] = { 0x0a, 0xff };
-	CHECK(lib_parse_batch(junk, sizeof(junk), &t) != 0, "junk");
+	CHECK(lib_parse_batch(junk, sizeof(junk), LIB_TRACK, &t) != 0, "junk");
+
+	/* The same reply read as albums: an Album's name and artists. */
+	Album named = ALBUM__INIT;
+	named.name = (char *)"Fever Daydream";
+	named.n_artist = 1;
+	named.artist = as;
+	size_t alen = album__get_packed_size(&named);
+	uint8_t *ab = malloc(alen);
+	album__pack(&named, ab);
+	any.value.data = ab;
+	any.value.len = alen;
+	d1.entity_uri = (char *)"spotify:album:aaaaaaaaaaaaaaaaaaaaaa";
+	len = spotify__extendedmetadata__batched_extension_response__get_packed_size(&res);
+	body = realloc(body, len);
+	spotify__extendedmetadata__batched_extension_response__pack(&res, body);
+	struct lib_tracks al_t = { NULL, 0, 0 };
+	al_t.cap = 1;
+	al_t.v = calloc(1, sizeof(*al_t.v));
+	al_t.v[al_t.n++].uri = strdup("spotify:album:aaaaaaaaaaaaaaaaaaaaaa");
+	CHECK(lib_parse_batch(body, len, LIB_ALBUM, &al_t) == 0 && al_t.v[0].title &&
+	      !strcmp(al_t.v[0].title, "Fever Daydream") && !strcmp(al_t.v[0].artist, "One"), "an album named");
+	lib_tracks_free(&al_t);
+	free(ab);
 
 	free(body);
 	free(tb);
 	lib_tracks_free(&t);
+	return 0;
+}
+
+static int collection(void)
+{
+	/* PageResponse { items: CollectionItem { uri, added_at, is_removed } ..., next_page_token } */
+	struct w page = { {0}, 0 }, a = { {0}, 0 }, b = { {0}, 0 }, c = { {0}, 0 }, d = { {0}, 0 };
+	w_str(&a, 1, "spotify:track:aaaaaaaaaaaaaaaaaaaaaa");
+	w_key(&a, 2, 0); w_varint(&a, 1700000000);
+	w_str(&b, 1, "spotify:album:bbbbbbbbbbbbbbbbbbbbbb");
+	w_str(&c, 1, "spotify:album:cccccccccccccccccccccc");
+	w_key(&c, 3, 0); w_varint(&c, 1);           /* removed */
+	w_str(&d, 1, "spotify:album:dddddddddddddddddddddd");
+	w_msg(&page, 1, &a);
+	w_msg(&page, 1, &b);
+	w_msg(&page, 1, &c);
+	w_msg(&page, 1, &d);
+	w_str(&page, 2, "token-2");
+	w_str(&page, 3, "sync");
+
+	struct lib_tracks t = { NULL, 0, 0 };
+	char next[64];
+	CHECK(lib_parse_collection(page.b, page.n, "spotify:album:", &t, next, sizeof(next)) == 0, "parses");
+	CHECK(t.n == 2 && !strcmp(t.v[0].uri, "spotify:album:bbbbbbbbbbbbbbbbbbbbbb") &&
+	      !strcmp(t.v[1].uri, "spotify:album:dddddddddddddddddddddd"), "albums only, removed ones left out, in order");
+	CHECK(!strcmp(next, "token-2"), "the next page's token");
+	lib_tracks_free(&t);
+	CHECK(lib_parse_collection(page.b, a.n + 1, "spotify:album:", &t, next, sizeof(next)) != 0, "cut short");
+	lib_tracks_free(&t);
+	CHECK(lib_parse_collection(page.b, 0, "spotify:album:", &t, next, sizeof(next)) == 0 && !t.n && !next[0],
+	      "empty: the last page");
+
+	/* The request side: what pbw writes, pb reads back. */
+	struct pbw rq;
+	struct pb rd;
+	struct pb_field f;
+	char s1[32], s2[32];
+	memset(&rq, 0, sizeof(rq));
+	pbw_str(&rq, 1, "jer");
+	pbw_str(&rq, 2, "artist");
+	pbw_str(&rq, 3, "");          /* empty: left out */
+	pbw_varint(&rq, 4, 300);
+	rd = pb_of(rq.b, rq.n);
+	CHECK(pb_next(&rd, &f) == 1 && f.num == 1, "username");
+	pb_str(&f, s1, sizeof(s1));
+	CHECK(pb_next(&rd, &f) == 1 && f.num == 2, "set");
+	pb_str(&f, s2, sizeof(s2));
+	CHECK(!strcmp(s1, "jer") && !strcmp(s2, "artist"), "strings round trip");
+	CHECK(pb_next(&rd, &f) == 1 && f.num == 4 && f.v == 300 && pb_next(&rd, &f) == 0 && !rq.over, "limit, no token");
 	return 0;
 }
 
@@ -223,7 +295,7 @@ static int wire(void)
 
 int main(void)
 {
-	if (context() || rootlist() || batch() || wire()) return 1;
+	if (context() || rootlist() || batch() || collection() || wire()) return 1;
 	printf("library: all checks passed\n");
 	return 0;
 }
