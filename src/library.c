@@ -12,6 +12,7 @@
 #include "proto/extended_metadata.pb-c.h"
 #include "proto/metadata.pb-c.h"
 #include <json-c/json.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #define ROOTLIST_PAGE 120
 #define COLLECTION_PAGE 300
 #define COLLECTION_TYPE "application/vnd.collection-v2.spotify.proto"
+#define RECENT 20 /* tracks radio leaves out, and names to Spotify */
 
 /* ------------------------------------------------------------------ tracks */
 
@@ -434,6 +436,138 @@ static int titles(const struct spclient *c, enum lib_kind kind, struct lib_track
 	return rc;
 }
 
+static int hand_over(const struct spclient *c, enum lib_kind kind, struct lib_tracks *t, uint32_t flags,
+                     mm_item_fn emit, void *ctx);
+
+/* ------------------------------------------------------------------ radio */
+
+static struct {
+	pthread_mutex_t lock;
+	char uri[RECENT][64];
+	int next, n;
+} REC = { PTHREAD_MUTEX_INITIALIZER, { { 0 } }, 0, 0 };
+
+void lib_recent_add(const char *uri)
+{
+	if (strlen(uri) >= sizeof(REC.uri[0])) return;
+	pthread_mutex_lock(&REC.lock);
+	snprintf(REC.uri[REC.next], sizeof(REC.uri[0]), "%s", uri);
+	REC.next = (REC.next + 1) % RECENT;
+	if (REC.n < RECENT) REC.n++;
+	pthread_mutex_unlock(&REC.lock);
+}
+
+/* The recent tracks, oldest first, into out. @returns how many. */
+static int recent(char out[RECENT][64])
+{
+	pthread_mutex_lock(&REC.lock);
+	int n = REC.n;
+	for (int i = 0; i < n; i++)
+		memcpy(out[i], REC.uri[(REC.next - n + i + RECENT) % RECENT], sizeof(out[0]));
+	pthread_mutex_unlock(&REC.lock);
+	return n;
+}
+
+static void collect_uris(json_object *o, struct lib_tracks *t, int *oom)
+{
+	if (*oom) return;
+	if (json_object_is_type(o, json_type_array)) {
+		size_t n = json_object_array_length(o);
+		for (size_t i = 0; i < n; i++) collect_uris(json_object_array_get_idx(o, i), t, oom);
+	} else if (json_object_is_type(o, json_type_object)) {
+		json_object_object_foreach(o, key, val) {
+			if (!strcmp(key, "uri") && json_object_is_type(val, json_type_string)) {
+				const char *s = json_object_get_string(val);
+				if (!strncmp(s, "spotify:track:", 14) && tracks_add(t, s) != 0) *oom = 1;
+			} else {
+				collect_uris(val, t, oom);
+			}
+		}
+	}
+}
+
+int lib_parse_uris(const char *json, struct lib_tracks *t)
+{
+	json_object *root = json_tokener_parse(json);
+	int oom = 0;
+	if (!root) return -1;
+	collect_uris(root, t, &oom);
+	json_object_put(root);
+	return oom ? -1 : 0;
+}
+
+/* Autoplay for `seed`, as Spotify's apps ask when a context runs out:
+ * an AutoplayContextRequest { context_uri, recent_track_uri... }. */
+static int autoplay(const struct spclient *c, const char *seed, char rec[][64], int nrec, struct lib_tracks *t,
+                    char *err, size_t errlen)
+{
+	struct pbw w;
+	struct spclient_reply r;
+	struct lib_pages more = { NULL, 0, 0 };
+	memset(&w, 0, sizeof(w));
+	pbw_str(&w, 1, seed);
+	for (int i = 0; i < nrec; i++) pbw_str(&w, 2, rec[i]);
+	if (w.over) {
+		snprintf(err, errlen, "autoplay request too long");
+		return -1;
+	}
+	if (spclient_post(c, "context-resolve/v1/autoplay", "application/json", "application/x-protobuf", w.b, w.n,
+	                  &r, err, errlen) != 0)
+		return -1;
+	int rc = lib_parse_context((const char *)r.body, t, &more);
+	free(r.body);
+	lib_pages_free(&more); /* the first page is plenty */
+	if (rc != 0) snprintf(err, errlen, "autoplay: not a context");
+	return rc;
+}
+
+/* Failing that, the seed's radio station. */
+static int station(const struct spclient *c, const char *seed, char rec[][64], int nrec, struct lib_tracks *t,
+                   char *err, size_t errlen)
+{
+	char path[2048];
+	struct spclient_reply r;
+	int o = snprintf(path, sizeof(path), "radio-apollo/v3/stations/%s?autoplay=true&count=50", seed);
+	for (int i = 0, first = 1; i < nrec && o < (int)sizeof(path) - 40; i++) {
+		if (strncmp(rec[i], "spotify:track:", 14) != 0) continue;
+		o += snprintf(path + o, sizeof(path) - (size_t)o, "%s%s", first ? "&prev_tracks=" : ",", rec[i] + 14);
+		first = 0;
+	}
+	if (spclient_get(c, path, "application/json", &r, err, errlen) != 0) return -1;
+	int rc = lib_parse_uris((const char *)r.body, t);
+	free(r.body);
+	if (rc != 0) snprintf(err, errlen, "radio station: not JSON");
+	return rc;
+}
+
+static int radio(const struct spclient *c, const char *seed, uint32_t flags, mm_item_fn emit, void *ctx,
+                 char *err, size_t errlen)
+{
+	char rec[RECENT][64];
+	int nrec = recent(rec);
+	struct lib_tracks t = { NULL, 0, 0 }, kept = { NULL, 0, 0 };
+	char why[256] = "";
+
+	if (autoplay(c, seed, rec, nrec, &t, why, sizeof(why)) != 0 || !t.n) {
+		if (spclient_debug) spclient_debug("radio %s: no autoplay (%s), trying its station", seed, why);
+		lib_tracks_free(&t);
+		if (station(c, seed, rec, nrec, &t, err, errlen) != 0) {
+			lib_tracks_free(&t);
+			return -1;
+		}
+	}
+	/* Leave out the seed, what was just played, and repeats. */
+	for (size_t i = 0; i < t.n; i++) {
+		int skip = !strcmp(t.v[i].uri, seed);
+		for (int k = 0; k < nrec && !skip; k++) skip = !strcmp(t.v[i].uri, rec[k]);
+		for (size_t k = 0; k < kept.n && !skip; k++) skip = !strcmp(t.v[i].uri, kept.v[k].uri);
+		if (!skip && tracks_add(&kept, t.v[i].uri) != 0) break;
+	}
+	lib_tracks_free(&t);
+	if (spclient_debug) spclient_debug("radio %s: %zu tracks", seed, kept.n);
+	return hand_over(c, LIB_TRACK, &kept, flags, emit, ctx);
+}
+
 /* ------------------------------------------------------------------ list */
 
 /* "daft punk!" → "spotify:search:daft+punk%21", as Spotify's apps write it. */
@@ -493,7 +627,8 @@ static int saved(const struct spclient *c, const char *user, const char *set, co
 int library_is_list(const char *uri)
 {
 	static const char *const prefixes[] = {
-		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", "spotify:search:", NULL
+		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", "spotify:search:",
+		"spotify:radio:", NULL
 	};
 	if (!strcmp(uri, "spotify:") || !strcmp(uri, "spotify:collection") ||
 	    !strcmp(uri, "spotify:collection:albums") || !strcmp(uri, "spotify:collection:artists"))
@@ -527,6 +662,7 @@ int library_list(const struct spclient *c, const char *user, const char *uri, ui
 		return saved(c, user, albums ? "collection" : "artist", albums ? "spotify:album:" : "spotify:artist:",
 		             albums ? LIB_ALBUM : LIB_ARTIST, flags, emit, ctx, err, errlen);
 	}
+	if (!strncmp(uri, "spotify:radio:", 14)) return radio(c, uri + 14, flags, emit, ctx, err, errlen);
 	int budget = MAX_PAGES;
 	if (!strcmp(uri, "spotify:collection")) {
 		snprintf(context, sizeof(context), "spotify:user:%s:collection", user);

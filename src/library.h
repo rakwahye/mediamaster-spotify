@@ -11,6 +11,9 @@
  *   spotify:album:<id>       an album's tracks
  *   spotify:artist:<id>      an artist's top tracks and latest release
  *   spotify:search:<words>   what Spotify's search finds (first page)
+ *   spotify:radio:<uri>      more like <uri>: Spotify's autoplay for it, or
+ *                            failing that its radio station; tracks played
+ *                            lately left out
  *
  * Tracks come from context-resolve, the endpoint Spotify's apps fill a
  * play context from (JSON, paged); your playlists from your rootlist
@@ -22,6 +25,9 @@
 
 #include "mm_plugin.h"
 #include "spclient.h"
+
+/** A track was played: radio leaves the last few out, and tells Spotify. */
+void lib_recent_add(const char *uri);
 
 /** 1 if `uri` is one of the lists above (decided without the network). */
 int library_is_list(const char *uri);
@@ -63,6 +69,11 @@ void lib_pages_free(struct lib_pages *p);
  * (page_url on a page without tracks, next_page_url) to `more`, in
  * order. @returns 0, or -1 if it is not one. */
 int lib_parse_context(const char *json, struct lib_tracks *t, struct lib_pages *more);
+
+/** Any JSON: every "uri" value that is a track, depth first, added to t.
+ * For replies whose exact shape is less certain (radio stations).
+ * @returns 0, or -1 if it is not JSON. */
+int lib_parse_uris(const char *json, struct lib_tracks *t);
 
 /** A rootlist reply: on_list(ctx, uri, name, owner) per playlist, in
  * order (folders flattened), and the full count into *total.

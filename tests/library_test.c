@@ -289,6 +289,31 @@ static int search(void)
 	return 0;
 }
 
+static int radio(void)
+{
+	struct lib_tracks t = { NULL, 0, 0 };
+	/* A station as it might come back: tracks wherever they sit, other
+	 * kinds of uri and duplicates included; the reader keeps every track. */
+	CHECK(lib_parse_uris("{\"title\":\"Radio\",\"uri\":\"spotify:station:track:x\","
+	                     "\"tracks\":[{\"uri\":\"spotify:track:aaaaaaaaaaaaaaaaaaaaaa\",\"artists\":[{\"uri\":\"spotify:artist:z\"}]},"
+	                     "{\"metadata\":{\"x\":1},\"uri\":\"spotify:track:bbbbbbbbbbbbbbbbbbbbbb\"}],"
+	                     "\"nextPage\":{\"items\":[{\"uri\":\"spotify:track:aaaaaaaaaaaaaaaaaaaaaa\"}]}}", &t) == 0,
+	      "parses");
+	CHECK(t.n == 3 && !strcmp(t.v[0].uri, "spotify:track:aaaaaaaaaaaaaaaaaaaaaa") &&
+	      !strcmp(t.v[1].uri, "spotify:track:bbbbbbbbbbbbbbbbbbbbbb"), "tracks only, wherever they are, in order");
+	CHECK(lib_parse_uris("[", &t) != 0, "not JSON");
+	lib_tracks_free(&t);
+
+	CHECK(library_is_list("spotify:radio:spotify:track:aaaaaaaaaaaaaaaaaaaaaa"), "radio is a list");
+	for (int i = 0; i < 30; i++) { /* more than it keeps: no overflow */
+		char u[64];
+		snprintf(u, sizeof(u), "spotify:track:%022d", i);
+		lib_recent_add(u);
+	}
+	lib_recent_add("spotify:track:this-one-is-far-too-long-to-be-a-track-id-at-all-really");
+	return 0;
+}
+
 static int wire(void)
 {
 	static const uint8_t bad_len[] = { 0x0a, 0x05, 'a' };       /* length past the end */
@@ -309,7 +334,7 @@ static int wire(void)
 
 int main(void)
 {
-	if (context() || rootlist() || batch() || collection() || search() || wire()) return 1;
+	if (context() || rootlist() || batch() || collection() || search() || radio() || wire()) return 1;
 	printf("library: all checks passed\n");
 	return 0;
 }

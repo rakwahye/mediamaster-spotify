@@ -246,6 +246,7 @@ static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_
 		else h->log(h, MM_LOG_INFO, "no tags: %s", err);
 	}
 
+	lib_recent_add(uri); /* radio leaves it out, and tells Spotify */
 	info->duration_ms = 0; /* known when the download completes */
 	info->flags = 0;
 	*stream = t;
