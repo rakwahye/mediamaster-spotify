@@ -12,10 +12,15 @@ endif
 SRC  := spike.c $(wildcard $(LRC)/src/*.c $(LRC)/src/proto/*.c $(LRC)/src/shannon/*.c)
 
 CFLAGS ?= -O2 -g
-CFLAGS += -pthread -D_GNU_SOURCE -I$(LRC) -I$(LRC)/src $(shell pkg-config --cflags $(PKGS))
+# What librespot-c's configure would define on Linux/glibc. Without
+# HAVE_SYS_UTSNAME_H the clienttoken request carries no platform data and
+# Spotify refuses it.
+LRC_DEFS := -DHAVE_SYS_UTSNAME_H -DHAVE_ENDIAN_H -DHAVE_PIPE2
+
+CFLAGS += -pthread -D_GNU_SOURCE $(LRC_DEFS) -I$(LRC) -I$(LRC)/src $(shell pkg-config --cflags $(PKGS))
 LDLIBS += $(shell pkg-config --libs $(PKGS)) -pthread
 
-spike: $(SRC)
+spike: $(SRC) Makefile
 	$(CC) $(CFLAGS) $(SRC) $(LDLIBS) -o $@
 
 clean:
