@@ -51,6 +51,13 @@ echo "$id" | grep -qx '[0-9a-f]\{40\}' || fail "device_id: $id"
 out=$("$M" spotify login 2>&1) && fail "login without credentials succeeded"
 echo "$out" | grep -q "no credentials: set spotify.credentials" || fail "login without credentials: $out"
 if "$M" spotify bogus >/dev/null 2>&1; then fail "unknown subcommand accepted"; fi
+
+# The source: spotify: URIs reach it, and fail cleanly without a login.
+out=$("$M" play spotify:track:4uLU6hMCjMI75M1A2tKUQC 2>&1) && fail "play without credentials succeeded"
+echo "$out" | grep -q "spotify could not open" || fail "play without credentials: $out"
+grep -q "no credentials" "$T/log" || fail "play did not try to log in"
+out=$("$M" play spotify:album:1 2>&1) && fail "album played as a track"
+grep -q "not a track: spotify:album:1" "$T/log" || fail "non-track URI: $out"
 stop
 
 # Imported credentials that Spotify will not take (here: cannot reach it).

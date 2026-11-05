@@ -15,7 +15,8 @@
 #   git -C <sub> checkout <rev> && git add <sub>
 #                                     move a pin
 #
-# Needs: libevent json-c libgcrypt libcurl protobuf-c (with headers).
+# Needs: libevent json-c libgcrypt libcurl protobuf-c (with headers);
+# ffmpeg with Vorbis to play, and to test.
 
 CC     ?= cc
 MM     ?= mediamaster
@@ -68,8 +69,25 @@ build/tests/creds: tests/creds_test.c src/creds.c src/creds.h Makefile
 	@mkdir -p $(@D)
 	$(CC) $(PLUG_CFLAGS) -Isrc tests/creds_test.c src/creds.c $(shell pkg-config --libs json-c) -o $@
 
-test: all build/tests/creds
+# 20 s of 44.1 kHz stereo Vorbis, like a Spotify file.
+TONE_MS := 20000
+build/tests/tone.ogg:
+	@mkdir -p $(@D)
+	@ffmpeg -nostdin -loglevel error -y -f lavfi -i sine=frequency=440:sample_rate=44100:duration=20 \
+	        -ac 2 -c:a libvorbis -q:a 6 $@
+
+build/tests/ogg: tests/ogg_test.c src/ogg.c src/ogg.h Makefile
+	@mkdir -p $(@D)
+	$(CC) $(PLUG_CFLAGS) -Isrc tests/ogg_test.c src/ogg.c -o $@
+
+build/tests/track: tests/track_test.c src/track.c src/ogg.c src/track.h src/ogg.h Makefile
+	@mkdir -p $(@D)
+	$(CC) $(PLUG_CFLAGS) -Isrc tests/track_test.c src/track.c src/ogg.c -pthread -o $@
+
+test: all build/tests/creds build/tests/ogg build/tests/track build/tests/tone.ogg
 	@build/tests/creds
+	@build/tests/ogg build/tests/tone.ogg $(TONE_MS)
+	@build/tests/track ffmpeg build/tests/tone.ogg $(TONE_MS)
 	@$(MAKE) --no-print-directory -C $(MM) build/mediamaster build/mmctl
 	@sh tests/load.sh $(MM)/build build
 

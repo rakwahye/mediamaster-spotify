@@ -13,17 +13,25 @@
  *                                  (default $XDG_CACHE_HOME/mediamaster/spotify)
  *   spotify.credentials = <file>   a librespot or ncspot credentials.json to
  *                                  log in with until mediamaster has its own
+ *   spotify.ffmpeg = <bin>         decoder (default ffmpeg)
+ *
+ * Plays spotify:track:<id>. Logs in on the first play if not logged in.
  *
  * Commands:
  *   spotify                  account state, cache location, library version
  *   spotify login | logout
  *
  * Files: spotify.c (this: the plugin), session.c (the account),
- * creds.c (credentials.json), lrc.c (librespot-c glue). */
+ * creds.c (credentials.json), lrc.c (librespot-c glue), track.c (one
+ * track: download, decode), ogg.c (Ogg page index). */
 
 #include "mm_plugin.h"
 #include "lrc.h"
 #include "session.h"
+#include "track.h"
+#include "librespot-c.h"
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -34,6 +42,119 @@ struct spotify {
 	const struct mm_host *h;
 	char cache[1024];
 };
+
+/* ------------------------------------------------------------------ channel
+ *
+ * A session streams one file at a time. The newest open takes the
+ * channel: an unfinished download is cut and plays as far as it got.
+ * That only ever bites a track being skipped or replaced, since a track
+ * still downloading near its end could not have played without gaps
+ * anyway. Each holder gets a ticket, so a download that is over before
+ * its open returns is not recorded as the owner afterwards. */
+
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t freed;
+	int busy;
+	uintptr_t ticket;
+	struct track *owner; /* NULL while the holder is still opening */
+} CH = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, NULL };
+
+static uintptr_t channel_take(void)
+{
+	pthread_mutex_lock(&CH.lock);
+	while (CH.busy) {
+		if (CH.owner) track_cut(CH.owner);
+		pthread_cond_wait(&CH.freed, &CH.lock);
+	}
+	CH.busy = 1;
+	CH.owner = NULL;
+	uintptr_t ticket = ++CH.ticket;
+	pthread_mutex_unlock(&CH.lock);
+	return ticket;
+}
+
+static void channel_give(uintptr_t ticket)
+{
+	pthread_mutex_lock(&CH.lock);
+	if (CH.busy && CH.ticket == ticket) {
+		CH.busy = 0;
+		CH.owner = NULL;
+		pthread_cond_broadcast(&CH.freed);
+	}
+	pthread_mutex_unlock(&CH.lock);
+}
+
+static void channel_own(uintptr_t ticket, struct track *t)
+{
+	pthread_mutex_lock(&CH.lock);
+	if (CH.busy && CH.ticket == ticket) CH.owner = t;
+	pthread_mutex_unlock(&CH.lock);
+}
+
+/* track_src.release: the download is over. */
+static void release(void *arg, int fd, int complete)
+{
+	(void)complete;
+	librespotc_close(fd);
+	channel_give((uintptr_t)arg);
+}
+
+/* ------------------------------------------------------------------ source */
+
+static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_info *info)
+{
+	const struct spotify *sp = priv;
+	const struct mm_host *h = sp->h;
+	char err[512];
+
+	if (strncmp(uri, "spotify:track:", 14) != 0) {
+		h->log(h, MM_LOG_WARN, "not a track: %s", uri);
+		return -1;
+	}
+	if (session_login(err, sizeof(err)) != 0) {
+		h->log(h, MM_LOG_WARN, "%s", err);
+		return -1;
+	}
+
+	uintptr_t ticket = channel_take();
+	struct sp_metadata md;
+	int fd = librespotc_open(uri, session_get());
+	if (fd < 0) {
+		h->log(h, MM_LOG_WARN, "%s: %s", uri, librespotc_last_errmsg());
+		channel_give(ticket);
+		return -1;
+	}
+	if (librespotc_metadata_get(&md, fd) < 0) md.file_len = 0;
+	librespotc_write(fd, NULL, NULL);
+
+	const char *ffmpeg = h->config_get(h, "ffmpeg");
+	struct track_src src = { fd, md.file_len, release, (void *)ticket };
+	struct track *t = track_open(h, uri, ffmpeg && *ffmpeg ? ffmpeg : "ffmpeg", &src);
+	if (!t) {
+		release((void *)ticket, fd, 0);
+		return -1;
+	}
+	channel_own(ticket, t);
+
+	info->duration_ms = 0; /* known when the download completes */
+	info->flags = 0;
+	*stream = t;
+	return 0;
+}
+
+static long sp_read(void *stream, float *dst, uint32_t frames) { return track_read(stream, dst, frames); }
+static void sp_interrupt(void *stream) { track_interrupt(stream); }
+static void sp_close(void *stream) { track_close(stream); }
+
+static const struct mm_source_ops source = {
+	.open      = sp_open,
+	.read      = sp_read,
+	.interrupt = sp_interrupt,
+	.close     = sp_close,
+};
+
+/* ------------------------------------------------------------------ plugin */
 
 static void default_cache(char *out, size_t cap)
 {
@@ -131,8 +252,10 @@ static const struct mm_plugin plugin = {
 	.name        = "spotify",
 	.version     = "0.1.0",
 	.description = "Spotify, via librespot-c",
+	.schemes     = "spotify",
 	.init        = spotify_init,
 	.fini        = spotify_fini,
+	.source      = &source,
 };
 
 MM_PLUGIN_DEFINE(spotify)
