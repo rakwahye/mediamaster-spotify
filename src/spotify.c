@@ -13,9 +13,12 @@
  *                            (default $XDG_CACHE_HOME/mediamaster/spotify)
  *
  * Commands:
- *   spotify                  login state and cache location */
+ *   spotify                  login state, cache location, library version
+ *
+ * Files: spotify.c (this: the plugin), lrc.c (librespot-c glue). */
 
 #include "mm_plugin.h"
+#include "lrc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,8 +50,8 @@ static int logged_in(const struct spotify *sp)
 static int verb_spotify(void *priv, struct mm_verb_ctx *c)
 {
 	const struct spotify *sp = priv;
-	snprintf(c->reply, c->reply_len, "%s, cache %s",
-	         logged_in(sp) ? "logged in" : "logged out", sp->cache);
+	snprintf(c->reply, c->reply_len, "%s, cache %s, %s",
+	         logged_in(sp) ? "logged in" : "logged out", sp->cache, lrc_version());
 	return MM_OK;
 }
 
@@ -62,7 +65,12 @@ static int spotify_init(const struct mm_host *h, void **priv)
 	if (cache && *cache) snprintf(sp->cache, sizeof(sp->cache), "%s", cache);
 	else default_cache(sp->cache, sizeof(sp->cache));
 
+	if (lrc_start(h) != 0) {
+		free(sp);
+		return -1;
+	}
 	if (h->register_verb(h, "spotify", "\tlogin state and cache location", verb_spotify, sp) != 0) {
+		lrc_stop();
 		free(sp);
 		return -1;
 	}
@@ -72,6 +80,7 @@ static int spotify_init(const struct mm_host *h, void **priv)
 
 static void spotify_fini(void *priv)
 {
+	lrc_stop();
 	free(priv);
 }
 

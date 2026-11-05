@@ -12,6 +12,10 @@ cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
 fail() { echo "FAIL load: $*" >&2; sed 's/^/  log| /' "$T/log" >&2; exit 1; }
 
+# A plugin exports its entry point and nothing else.
+exports=$(nm -D --defined-only "$PLUG/spotify.so" | awk '{print $3}')
+[ "$exports" = mm_plugin_entry ] || { echo "FAIL load: spotify.so exports: $exports" >&2; exit 1; }
+
 export MM_SOCK="$T/mm.sock"
 M="$HOST/mmctl"
 
@@ -26,11 +30,11 @@ done
 
 "$M" plugins | grep -q "^spotify .*active.*attrs=network,login,rate-limited,unofficial-api .*spotify.so$" \
 	|| fail "spotify.so is not active with its attributes"
-[ "$("$M" spotify)" = "ok logged out, cache $T/cache" ] || fail "spotify verb: $("$M" spotify)"
+[ "$("$M" spotify)" = "ok logged out, cache $T/cache, librespot-c 0.9" ] || fail "spotify verb: $("$M" spotify)"
 
 mkdir -p "$T/cache"
 : >"$T/cache/credentials"
-[ "$("$M" spotify)" = "ok logged in, cache $T/cache" ] || fail "credentials not noticed"
+[ "$("$M" spotify)" = "ok logged in, cache $T/cache, librespot-c 0.9" ] || fail "credentials not noticed"
 
 "$M" quit >/dev/null
 wait "$PID" || fail "daemon exit status"
