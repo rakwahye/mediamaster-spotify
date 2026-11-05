@@ -11,9 +11,10 @@
  *   spotify:album:<id>       an album's tracks
  *   spotify:artist:<id>      an artist's top tracks and latest release
  *   spotify:search:<words>   what Spotify's search finds (first page)
- *   spotify:radio:<uri>      more like <uri>: Spotify's autoplay for it, or
- *                            failing that its radio station; tracks played
- *                            lately left out
+ *
+ * And radio (library_radio): more like a seed, Spotify's autoplay for it
+ * or failing that its radio station, tracks played lately left out. A
+ * seed from elsewhere is first found on Spotify by its tags and length.
  *
  * Tracks come from context-resolve, the endpoint Spotify's apps fill a
  * play context from (JSON, paged); your playlists from your rootlist
@@ -28,6 +29,14 @@
 
 /** A track was played: radio leaves the last few out, and tells Spotify. */
 void lib_recent_add(const char *uri);
+
+/** mm_catalog_ops.radio. @returns 0, or -1 with err set. */
+int library_radio(const struct spclient *c, const char *user, const struct mm_item *seed, uint32_t flags,
+                  mm_item_fn emit, void *ctx, char *err, size_t errlen);
+
+/** A seed with no tags: its file name as search words ("Artist_Name-Album-
+ * 01-Title.mp3" → "Artist Name Album Title"). */
+void lib_words_from_uri(const char *uri, char *out, size_t cap);
 
 /** 1 if `uri` is one of the lists above (decided without the network). */
 int library_is_list(const char *uri);

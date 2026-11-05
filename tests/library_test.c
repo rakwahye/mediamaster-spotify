@@ -304,7 +304,14 @@ static int radio(void)
 	CHECK(lib_parse_uris("[", &t) != 0, "not JSON");
 	lib_tracks_free(&t);
 
-	CHECK(library_is_list("spotify:radio:spotify:track:aaaaaaaaaaaaaaaaaaaaaa"), "radio is a list");
+	CHECK(!library_is_list("spotify:radio:spotify:track:aaaaaaaaaaaaaaaaaaaaaa"), "radio is an op, not a list");
+	char w[256];
+	lib_words_from_uri("/home/u/Music/youtube/666/Carpenter_Brut-Leather_Terror-01-Opening_Title.mp3", w, sizeof(w));
+	CHECK(!strcmp(w, "Carpenter Brut Leather Terror Opening Title"), "file name to words");
+	lib_words_from_uri("/m/03. Song (Live) [2019].flac", w, sizeof(w));
+	CHECK(!strcmp(w, "Song Live"), "numbers and brackets dropped");
+	lib_words_from_uri("/m/.flac", w, sizeof(w));
+	CHECK(!w[0] || !strcmp(w, "flac"), "nothing much to go on");
 	for (int i = 0; i < 30; i++) { /* more than it keeps: no overflow */
 		char u[64];
 		snprintf(u, sizeof(u), "spotify:track:%022d", i);

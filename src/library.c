@@ -568,6 +568,94 @@ static int radio(const struct spclient *c, const char *seed, uint32_t flags, mm_
 	return hand_over(c, LIB_TRACK, &kept, flags, emit, ctx);
 }
 
+/* ------------------------------------------------------------------ foreign seeds */
+
+#define MATCH_MS 3000 /* a hit this close in length is the same recording */
+
+void lib_words_from_uri(const char *uri, char *out, size_t cap)
+{
+	const char *base = strrchr(uri, '/');
+	base = base ? base + 1 : uri;
+	const char *dot = strrchr(base, '.');
+	size_t n = dot && dot != base ? (size_t)(dot - base) : strlen(base), o = 0;
+	char word[256];
+	size_t wl = 0;
+	out[0] = '\0';
+	for (size_t i = 0; i <= n; i++) {
+		char ch = i < n ? base[i] : ' ';
+		int sep = ch == ' ' || ch == '_' || ch == '-' || ch == '.' || ch == '(' || ch == ')' || ch == '[' || ch == ']';
+		if (!sep && wl + 1 < sizeof(word)) {
+			word[wl++] = ch;
+			continue;
+		}
+		if (!sep) continue;
+		word[wl] = '\0';
+		int digits = wl > 0;
+		for (size_t k = 0; k < wl && digits; k++) digits = word[k] >= '0' && word[k] <= '9';
+		if (wl && !digits && o + wl + 2 < cap) o += (size_t)snprintf(out + o, cap - o, "%s%s", o ? " " : "", word);
+		wl = 0;
+	}
+}
+
+struct pick { uint64_t want_ms; int strict; char uri[64]; };
+
+static int pick_hit(void *ctx, const struct mm_item *it)
+{
+	struct pick *p = ctx;
+	if (it->kind != MM_ITEM_TRACK || !it->uri || strlen(it->uri) >= sizeof(p->uri)) return 0;
+	if (p->want_ms && it->duration_ms) {
+		uint64_t d = it->duration_ms > p->want_ms ? it->duration_ms - p->want_ms : p->want_ms - it->duration_ms;
+		if (d > MATCH_MS) return 0;
+	} else if (p->strict) {
+		return 0; /* nothing to check the match by */
+	}
+	snprintf(p->uri, sizeof(p->uri), "%s", it->uri);
+	return 1;
+}
+
+/* A seed from another source → the same recording on Spotify, or "". */
+static int find_seed(const struct spclient *c, const char *user, const struct mm_item *seed, char *out,
+                     size_t cap, char *err, size_t errlen)
+{
+	char words[1024], uri[1100];
+	struct pick p = { seed->duration_ms, 0, "" };
+	if (seed->title && seed->artist) {
+		snprintf(words, sizeof(words), "%s %s", seed->artist, seed->title);
+	} else {
+		/* A guess from the file name: only with a length to check it by. */
+		lib_words_from_uri(seed->uri, words, sizeof(words));
+		p.strict = 1;
+	}
+	if (!words[0]) {
+		snprintf(err, errlen, "nothing to search by");
+		return -1;
+	}
+	snprintf(uri, sizeof(uri), "spotify:search:%s", words);
+	if (library_list(c, user, uri, 0, pick_hit, &p, err, errlen) != 0) return -1;
+	if (!p.uri[0]) {
+		snprintf(err, errlen, "no match on Spotify for '%s'", words);
+		return -1;
+	}
+	if (spclient_debug) spclient_debug("radio: '%s' is %s", words, p.uri);
+	snprintf(out, cap, "%s", p.uri);
+	return 0;
+}
+
+int library_radio(const struct spclient *c, const char *user, const struct mm_item *seed, uint32_t flags,
+                  mm_item_fn emit, void *ctx, char *err, size_t errlen)
+{
+	char uri[64];
+	if (!seed || !seed->uri) {
+		snprintf(err, errlen, "no seed");
+		return -1;
+	}
+	if (!strncmp(seed->uri, "spotify:track:", 14) && strlen(seed->uri) < sizeof(uri))
+		snprintf(uri, sizeof(uri), "%s", seed->uri);
+	else if (find_seed(c, user, seed, uri, sizeof(uri), err, errlen) != 0)
+		return -1;
+	return radio(c, uri, flags, emit, ctx, err, errlen);
+}
+
 /* ------------------------------------------------------------------ list */
 
 /* "daft punk!" → "spotify:search:daft+punk%21", as Spotify's apps write it. */
@@ -627,8 +715,7 @@ static int saved(const struct spclient *c, const char *user, const char *set, co
 int library_is_list(const char *uri)
 {
 	static const char *const prefixes[] = {
-		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", "spotify:search:",
-		"spotify:radio:", NULL
+		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", "spotify:search:", NULL
 	};
 	if (!strcmp(uri, "spotify:") || !strcmp(uri, "spotify:collection") ||
 	    !strcmp(uri, "spotify:collection:albums") || !strcmp(uri, "spotify:collection:artists"))
@@ -662,7 +749,6 @@ int library_list(const struct spclient *c, const char *user, const char *uri, ui
 		return saved(c, user, albums ? "collection" : "artist", albums ? "spotify:album:" : "spotify:artist:",
 		             albums ? LIB_ALBUM : LIB_ARTIST, flags, emit, ctx, err, errlen);
 	}
-	if (!strncmp(uri, "spotify:radio:", 14)) return radio(c, uri + 14, flags, emit, ctx, err, errlen);
 	int budget = MAX_PAGES;
 	if (!strcmp(uri, "spotify:collection")) {
 		snprintf(context, sizeof(context), "spotify:user:%s:collection", user);

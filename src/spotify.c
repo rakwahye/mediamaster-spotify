@@ -320,7 +320,22 @@ static int sp_list(void *priv, const char *uri, uint32_t flags, mm_item_fn emit,
 	return library_list(&c, user, uri, flags, emit, ctx, err, errlen);
 }
 
-static const struct mm_catalog_ops catalog = { .list = sp_list };
+static int sp_radio(void *priv, const struct mm_item *seed, uint32_t flags, mm_item_fn emit, void *ctx,
+                    char *err, size_t errlen)
+{
+	const struct spotify *sp = priv;
+	struct spclient c;
+	char user[64];
+
+	if (session_login(err, errlen) != 0 || spclient_ready(sp->h, &c, err, errlen) != 0) return -1;
+	if (session_username(user, sizeof(user)) != 0) {
+		snprintf(err, errlen, "logged out");
+		return -1;
+	}
+	return library_radio(&c, user, seed, flags, emit, ctx, err, errlen);
+}
+
+static const struct mm_catalog_ops catalog = { .list = sp_list, .radio = sp_radio };
 
 static const struct mm_source_ops source = {
 	.open      = sp_open,
