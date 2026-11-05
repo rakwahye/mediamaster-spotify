@@ -65,6 +65,7 @@ int ogg_index_scan(struct ogg_index *ix, const uint8_t *buf, size_t have)
 			}
 			ix->pages[ix->npages].offset = ix->scanned;
 			ix->pages[ix->npages].granule = g;
+			ix->pages[ix->npages].continued = p[5] & 1;
 			ix->npages++;
 		}
 		ix->scanned += len;
@@ -76,4 +77,23 @@ uint64_t ogg_index_duration_ms(const struct ogg_index *ix)
 {
 	if (!ix->rate || !ix->npages) return 0;
 	return (uint64_t)ix->pages[ix->npages - 1].granule * 1000u / ix->rate;
+}
+
+size_t ogg_index_seek(const struct ogg_index *ix, int64_t target, int64_t preroll)
+{
+	/* Page i starts after the samples of page i-1 end. Binary search for
+	 * the last page with granule(i-1) <= target - preroll, then step back
+	 * to one that does not continue a packet. */
+	size_t lo = 1, hi = ix->npages, best = 0;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (ix->pages[mid - 1].granule <= target - preroll) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	while (best > 0 && ix->pages[best].continued) best--;
+	return best > 0 ? ix->pages[best].offset : ix->header_end;
 }

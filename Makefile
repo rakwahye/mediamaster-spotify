@@ -69,12 +69,13 @@ build/tests/creds: tests/creds_test.c src/creds.c src/creds.h Makefile
 	@mkdir -p $(@D)
 	$(CC) $(PLUG_CFLAGS) -Isrc tests/creds_test.c src/creds.c $(shell pkg-config --libs json-c) -o $@
 
-# 20 s of 44.1 kHz stereo Vorbis, like a Spotify file.
-TONE_MS := 20000
-build/tests/tone.ogg:
+# 20 s of 44.1 kHz stereo Vorbis in ~100 ms pages, like a Spotify file.
+# Noise, so a seek that lands a few samples off cannot pass for exact.
+OGG_MS := 20000
+build/tests/noise.ogg:
 	@mkdir -p $(@D)
-	@ffmpeg -nostdin -loglevel error -y -f lavfi -i sine=frequency=440:sample_rate=44100:duration=20 \
-	        -ac 2 -c:a libvorbis -q:a 6 $@
+	@ffmpeg -nostdin -loglevel error -y -f lavfi -i anoisesrc=c=pink:seed=7:a=0.3:r=44100:d=20 \
+	        -ac 2 -c:a libvorbis -q:a 8 -page_duration 100000 $@
 
 build/tests/ogg: tests/ogg_test.c src/ogg.c src/ogg.h Makefile
 	@mkdir -p $(@D)
@@ -84,10 +85,10 @@ build/tests/track: tests/track_test.c src/track.c src/ogg.c src/track.h src/ogg.
 	@mkdir -p $(@D)
 	$(CC) $(PLUG_CFLAGS) -Isrc tests/track_test.c src/track.c src/ogg.c -pthread -o $@
 
-test: all build/tests/creds build/tests/ogg build/tests/track build/tests/tone.ogg
+test: all build/tests/creds build/tests/ogg build/tests/track build/tests/noise.ogg
 	@build/tests/creds
-	@build/tests/ogg build/tests/tone.ogg $(TONE_MS)
-	@build/tests/track ffmpeg build/tests/tone.ogg $(TONE_MS)
+	@build/tests/ogg build/tests/noise.ogg $(OGG_MS)
+	@build/tests/track ffmpeg build/tests/noise.ogg $(OGG_MS)
 	@$(MAKE) --no-print-directory -C $(MM) build/mediamaster build/mmctl
 	@sh tests/load.sh $(MM)/build build
 

@@ -43,6 +43,21 @@ int main(int argc, char **argv)
 		      "pages in order");
 	CHECK(ogg_index_duration_ms(&a) == want, "length from the last granule");
 
+	/* Seek lookup: the latest packet-starting page that leaves the
+	 * preroll before the target. */
+	const int64_t pre = 16384, end = a.pages[a.npages - 1].granule;
+	CHECK(ogg_index_seek(&a, 0, pre) == a.header_end, "near the start: from the start");
+	for (int64_t target = pre; target < end; target += 9973) {
+		size_t off = ogg_index_seek(&a, target, pre), i = 0;
+		while (i < a.npages && a.pages[i].offset != off) i++;
+		if (off == a.header_end) continue; /* too early for any later page */
+		CHECK(i < a.npages && i > 0, "lands on an indexed page");
+		CHECK(!a.pages[i].continued, "that starts a packet");
+		CHECK(a.pages[i - 1].granule <= target - pre, "with the preroll before the target");
+		for (size_t j = i + 1; j < a.npages; j++)
+			CHECK(a.pages[j].continued || a.pages[j - 1].granule > target - pre, "and none later would do");
+	}
+
 	/* In odd pieces, as a download arrives: the same index. */
 	struct ogg_index b;
 	ogg_index_init(&b);

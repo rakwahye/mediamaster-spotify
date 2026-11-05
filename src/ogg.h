@@ -16,6 +16,7 @@
 struct ogg_page {
 	size_t offset;
 	int64_t granule; /* samples at the end of the page */
+	int continued;   /* begins with the tail of the previous page's packet */
 };
 
 struct ogg_index {
@@ -36,5 +37,12 @@ int ogg_index_scan(struct ogg_index *ix, const uint8_t *buf, size_t have);
 
 /** Length so far, in ms; exact once the whole stream is scanned. */
 uint64_t ogg_index_duration_ms(const struct ogg_index *ix);
+
+/** Where to start decoding to reach sample `target` (at ix->rate): the
+ * offset of an indexed page that starts a packet, at least `preroll`
+ * samples before the target, and as late as possible. Bytes from there
+ * on, after the header pages, decode to audio up to and past the target.
+ * @returns the offset, or header_end when nothing later qualifies. */
+size_t ogg_index_seek(const struct ogg_index *ix, int64_t target, int64_t preroll);
 
 #endif

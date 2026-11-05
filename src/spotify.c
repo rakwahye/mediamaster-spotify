@@ -210,12 +210,14 @@ static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_
 }
 
 static long sp_read(void *stream, float *dst, uint32_t frames) { return track_read(stream, dst, frames); }
+static int sp_seek(void *stream, uint64_t ms) { return track_seek(stream, ms); }
 static void sp_interrupt(void *stream) { track_interrupt(stream); }
 static void sp_close(void *stream) { track_close(stream); }
 
 static const struct mm_source_ops source = {
 	.open      = sp_open,
 	.read      = sp_read,
+	.seek      = sp_seek,
 	.interrupt = sp_interrupt,
 	.close     = sp_close,
 };

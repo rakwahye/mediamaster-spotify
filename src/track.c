@@ -39,6 +39,7 @@ extern char **environ;
 struct track {
 	const struct mm_host *h;
 	char name[128];
+	char ffmpeg[256];
 	struct track_src src;
 
 	pthread_mutex_t lock;
@@ -57,6 +58,8 @@ struct track {
 	int wake[2];           /* self-pipe: interrupt read() */
 	pid_t pid;
 	int in, out;           /* ffmpeg's stdin (ours to write), stdout */
+	size_t feed_head;      /* the feeder sends [0, feed_head), then */
+	size_t feed_from;      /* [feed_from, end); both 0 for the whole */
 	pthread_t dl, feed;
 	int dl_on, feed_on;
 
@@ -66,16 +69,38 @@ struct track {
 
 /* ------------------------------------------------------------------ ffmpeg */
 
-static int spawn_ffmpeg(struct track *t, const char *ffmpeg)
+/* Decode Ogg on stdin to host PCM on stdout. With a filter `af`, the
+ * input starts mid-stream: -copyts keeps the timestamps the Ogg demuxer
+ * derives from the page granules, which the filter trims by. */
+static int spawn_ffmpeg(struct track *t, const char *af)
 {
-	char *argv[] = {
-		(char *)ffmpeg, (char *)"-nostdin", (char *)"-hide_banner",
-		(char *)"-loglevel", (char *)"error",
-		(char *)"-f", (char *)"ogg", (char *)"-i", (char *)"pipe:0",
-		(char *)"-map", (char *)"0:a:0", (char *)"-f", (char *)"f32le",
-		(char *)"-ar", (char *)"48000", (char *)"-ac", (char *)"2", (char *)"pipe:1",
-		NULL
-	};
+	char *argv[24];
+	int n = 0;
+	argv[n++] = t->ffmpeg;
+	argv[n++] = (char *)"-nostdin";
+	argv[n++] = (char *)"-hide_banner";
+	argv[n++] = (char *)"-loglevel";
+	argv[n++] = (char *)"error";
+	if (af) argv[n++] = (char *)"-copyts";
+	argv[n++] = (char *)"-f";
+	argv[n++] = (char *)"ogg";
+	argv[n++] = (char *)"-i";
+	argv[n++] = (char *)"pipe:0";
+	argv[n++] = (char *)"-map";
+	argv[n++] = (char *)"0:a:0";
+	if (af) {
+		argv[n++] = (char *)"-af";
+		argv[n++] = (char *)af;
+	}
+	argv[n++] = (char *)"-f";
+	argv[n++] = (char *)"f32le";
+	argv[n++] = (char *)"-ar";
+	argv[n++] = (char *)"48000";
+	argv[n++] = (char *)"-ac";
+	argv[n++] = (char *)"2";
+	argv[n++] = (char *)"pipe:1";
+	argv[n] = NULL;
+
 	int pi[2], po[2];
 	posix_spawn_file_actions_t fa;
 	posix_spawnattr_t at;
@@ -95,13 +120,13 @@ static int spawn_ffmpeg(struct track *t, const char *ffmpeg)
 	posix_spawnattr_setsigmask(&at, &none);
 	posix_spawnattr_setsigdefault(&at, &all);
 	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-	int rc = posix_spawnp(&t->pid, ffmpeg, &fa, &at, argv, environ);
+	int rc = posix_spawnp(&t->pid, t->ffmpeg, &fa, &at, argv, environ);
 	posix_spawnattr_destroy(&at);
 	posix_spawn_file_actions_destroy(&fa);
 	close(pi[0]);
 	close(po[1]);
 	if (rc != 0) {
-		t->h->log(t->h, MM_LOG_WARN, "cannot run %s: %s", ffmpeg, strerror(rc));
+		t->h->log(t->h, MM_LOG_WARN, "cannot run %s: %s", t->ffmpeg, strerror(rc));
 		close(pi[1]);
 		close(po[0]);
 		t->pid = -1;
@@ -232,7 +257,7 @@ static void *download(void *arg)
 	t->done = 1;
 	if (got == FETCH_ALL) {
 		t->info.duration_ms = ogg_index_duration_ms(&t->ix);
-		t->info.flags = 0;
+		t->info.flags = MM_STREAM_SEEKABLE;
 		t->report = 1;
 	}
 	int send = report_due(t);
@@ -256,7 +281,7 @@ static void *feed(void *arg)
 {
 	struct track *t = arg;
 	uint8_t chunk[FEED_CHUNK];
-	size_t pos = 0;
+	size_t pos = 0, head = t->feed_head, from = t->feed_from;
 	sigset_t pipe_sig;
 
 	/* A decoder that went away is EPIPE here, not a signal. */
@@ -265,14 +290,16 @@ static void *feed(void *arg)
 	pthread_sigmask(SIG_BLOCK, &pipe_sig, NULL);
 
 	for (;;) {
+		if (pos == head && from > head) pos = head = from; /* the jump */
 		pthread_mutex_lock(&t->lock);
-		while (pos == t->have && !t->done && !t->stopping)
+		while (pos >= t->have && !t->done && !t->stopping)
 			pthread_cond_wait(&t->more, &t->lock);
-		size_t n = t->have - pos;
+		size_t n = t->have > pos ? t->have - pos : 0;
 		if (t->stopping || n == 0) {
 			pthread_mutex_unlock(&t->lock);
 			break;
 		}
+		if (pos < head && n > head - pos) n = head - pos;
 		if (n > sizeof(chunk)) n = sizeof(chunk);
 		memcpy(chunk, t->buf + pos, n);
 		pthread_mutex_unlock(&t->lock);
@@ -292,6 +319,47 @@ out:
 	return NULL;
 }
 
+/* ------------------------------------------------------------------ decoder */
+
+/* ffmpeg plus the feeder thread that fills it. */
+static int decoder_start(struct track *t, const char *af, size_t head, size_t from)
+{
+	if (spawn_ffmpeg(t, af) != 0) return -1;
+	pthread_mutex_lock(&t->lock);
+	t->stopping = 0;
+	pthread_mutex_unlock(&t->lock);
+	t->feed_head = head;
+	t->feed_from = from;
+	t->part_len = 0;
+	if (pthread_create(&t->feed, NULL, feed, t) != 0) {
+		close(t->in);
+		t->in = -1;
+		close(t->out);
+		t->out = -1;
+		stop_ffmpeg(t->pid);
+		t->pid = -1;
+		return -1;
+	}
+	t->feed_on = 1;
+	return 0;
+}
+
+static void decoder_stop(struct track *t)
+{
+	if (!t->feed_on) return;
+	pthread_mutex_lock(&t->lock);
+	t->stopping = 1;
+	pthread_cond_broadcast(&t->more);
+	pthread_mutex_unlock(&t->lock);
+	stop_ffmpeg(t->pid);   /* a blocked feeder gets EPIPE */
+	t->pid = -1;
+	pthread_join(t->feed, NULL);
+	t->feed_on = 0;
+	if (t->out >= 0) close(t->out);
+	t->out = -1;
+	t->part_len = 0;
+}
+
 /* ------------------------------------------------------------------ ops */
 
 static void close_pair(int p[2])
@@ -308,6 +376,7 @@ struct track *track_open(const struct mm_host *h, const char *name, const char *
 	t->h = h;
 	t->src = *src;
 	snprintf(t->name, sizeof(t->name), "%s", name);
+	snprintf(t->ffmpeg, sizeof(t->ffmpeg), "%s", ffmpeg);
 	t->cut[0] = t->cut[1] = t->wake[0] = t->wake[1] = -1;
 	t->pid = -1;
 	t->in = t->out = -1;
@@ -321,24 +390,13 @@ struct track *track_open(const struct mm_host *h, const char *name, const char *
 	}
 	if (pipe2(t->cut, O_CLOEXEC | O_NONBLOCK) != 0 || pipe2(t->wake, O_CLOEXEC | O_NONBLOCK) != 0)
 		goto fail;
-	if (spawn_ffmpeg(t, ffmpeg) != 0) goto fail;
-	if (pthread_create(&t->feed, NULL, feed, t) != 0) goto fail;
-	t->feed_on = 1;
+	if (decoder_start(t, NULL, 0, 0) != 0) goto fail;
 	if (pthread_create(&t->dl, NULL, download, t) != 0) goto fail;
 	t->dl_on = 1;
 	return t;
 
-fail:
-	if (t->feed_on) { /* the download never started: nothing released */
-		pthread_mutex_lock(&t->lock);
-		t->stopping = 1;
-		pthread_cond_broadcast(&t->more);
-		pthread_mutex_unlock(&t->lock);
-		pthread_join(t->feed, NULL);
-	}
-	if (t->out >= 0) close(t->out);
-	if (t->in >= 0) close(t->in);
-	if (t->pid > 0) stop_ffmpeg(t->pid);
+fail: /* the download never started: nothing released */
+	decoder_stop(t);
 	close_pair(t->cut);
 	close_pair(t->wake);
 	pthread_cond_destroy(&t->more);
@@ -394,6 +452,48 @@ long track_read(struct track *t, float *dst, uint32_t frames)
 	return (long)(whole / FRAME_BYTES);
 }
 
+/* Samples of decode before the target, so the decoder is in step by
+ * then: two of Vorbis' largest blocks. */
+#define SEEK_PREROLL 16384
+
+static uint64_t gcd(uint64_t a, uint64_t b)
+{
+	while (b) { uint64_t r = a % b; a = b; b = r; }
+	return a;
+}
+
+/* Exact, and the same samples a straight decode gives: decoding starts
+ * from a page before the target; the decoded audio is trimmed at the
+ * source rate to a sample where both rates meet (every 147 samples at
+ * 44.1 kHz), so the resampler runs in the same phase as from the start;
+ * the last few frames up to the target are trimmed after it. */
+int track_seek(struct track *t, uint64_t ms)
+{
+	char af[128];
+	size_t head = 0, from = 0;
+
+	if (ms) {
+		pthread_mutex_lock(&t->lock);
+		uint64_t rate = t->ix.rate;
+		int known = rate && t->ix.npages;
+		if (known) {
+			uint64_t grid = rate / gcd(rate, MM_PCM_RATE);
+			uint64_t at = ms * rate / 1000 / grid * grid;
+			uint64_t skip = ms * MM_PCM_RATE / 1000 - at * MM_PCM_RATE / rate;
+			snprintf(af, sizeof(af), "atrim=start_pts=%llu,aresample=%u,atrim=start_sample=%llu",
+			         (unsigned long long)at, MM_PCM_RATE, (unsigned long long)skip);
+			head = t->ix.header_end;
+			from = ogg_index_seek(&t->ix, (int64_t)at, SEEK_PREROLL);
+		}
+		pthread_mutex_unlock(&t->lock);
+		if (!known) return -1;
+	}
+	decoder_stop(t);
+	char b[16];
+	while (read(t->wake[0], b, sizeof(b)) > 0) { } /* a seek clears an interrupt */
+	return decoder_start(t, ms ? af : NULL, head, from);
+}
+
 void track_interrupt(struct track *t)
 {
 	char c = 1;
@@ -417,14 +517,7 @@ void track_close(struct track *t)
 	track_cut(t);
 	pthread_join(t->dl, NULL);
 
-	pthread_mutex_lock(&t->lock);
-	t->stopping = 1;
-	pthread_cond_broadcast(&t->more);
-	pthread_mutex_unlock(&t->lock);
-	stop_ffmpeg(t->pid);            /* a blocked feeder gets EPIPE */
-	pthread_join(t->feed, NULL);
-	if (t->out >= 0) close(t->out);
-
+	decoder_stop(t);
 	close_pair(t->cut);
 	close_pair(t->wake);
 	pthread_cond_destroy(&t->more);

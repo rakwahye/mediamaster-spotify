@@ -226,6 +226,38 @@ static int resumes_now(size_t *from)
 
 static const struct track_io io_resumable = { release, fake_resume, fake_cancel, count_free };
 
+/* Read exactly `frames` frames (fewer only at the end). */
+static long read_n(struct track *t, float *dst, long frames)
+{
+	long got = 0, r;
+	while (got < frames && (r = track_read(t, dst + got * 2, (uint32_t)(frames - got))) > 0) got += r;
+	return got;
+}
+
+/* How far `got` sits from ref[at...], in frames, searching +-span: the
+ * offset with the least error, and that error (max abs, left channel,
+ * skipping the resampler's first `settle` frames). */
+static long offset_of(const float *ref, long ref_frames, long at, const float *got, long n,
+                      long span, long settle, float *err)
+{
+	long best = 0;
+	float best_err = 1e9f;
+	for (long d = -span; d <= span; d++) {
+		float e = 0;
+		for (long i = settle; i < n; i++) {
+			long j = at + d + i;
+			if (j < 0 || j >= ref_frames) { e = 1e9f; break; }
+			float x = ref[j * 2] - got[i * 2];
+			if (x < 0) x = -x;
+			if (x > e) e = x;
+			if (e >= best_err) break;
+		}
+		if (e < best_err) { best_err = e; best = d; }
+	}
+	*err = best_err;
+	return best;
+}
+
 static long drain(struct track *t, int note_read)
 {
 	static float pcm[4096 * 2];
@@ -395,7 +427,55 @@ int main(int argc, char **argv)
 	pthread_join(w.th, NULL);
 	close(w.fd);
 
-	/* 10. No decoder: open fails and leaves the fd to the caller. */
+	/* 10. Seeks land on the sample: compared with a straight decode. */
+	static float ref[20 * 48000 * 2 + 4096 * 2], got_pcm[8192 * 2];
+	reset();
+	src.fd = feed_start(&w, file_len, 0);
+	src.size = file_len;
+	t = track_open(&host, "reference", ffmpeg, &src);
+	CHECK(t, "open");
+	long ref_frames = read_n(t, ref, (long)(sizeof(ref) / sizeof(ref[0]) / 2));
+	track_close(t);
+	pthread_join(w.th, NULL);
+	CHECK(ref_frames > want_frames - 480, "reference decode");
+
+	static const uint64_t targets[] = { 37, 1234, 7777, 15000, 19500 };
+	for (size_t k = 0; k < sizeof(targets) / sizeof(targets[0]); k++) {
+		reset();
+		src.fd = feed_start(&w, file_len, 0);
+		t = track_open(&host, "seek", ffmpeg, &src);
+		CHECK(t, "open");
+		CHECK(read_n(t, got_pcm, 2048) == 2048, "playing");
+		for (int i = 0; i < 200 && !seen().complete; i++) usleep(5000);
+		CHECK(track_seek(t, targets[k]) == 0, "seek");
+		long n = read_n(t, got_pcm, 8192);
+		float err;
+		long at = (long)targets[k] * 48;
+		long off = offset_of(ref, ref_frames, at, got_pcm, n < 4096 ? n : 4096, 960, 64, &err);
+		if (getenv("VERBOSE") || off != 0 || err != 0)
+			fprintf(stderr, "seek %llu ms: %ld frames off, error %g\n", (unsigned long long)targets[k], off, err);
+		CHECK(n >= 4096 && off == 0 && err == 0, "seek gives the very samples of a straight decode");
+		track_close(t);
+		pthread_join(w.th, NULL);
+	}
+
+	/* 11. A seek past what has arrived plays from there once it does. */
+	reset();
+	src.fd = feed_start(&w, file_len, 20000); /* about half a second */
+	t = track_open(&host, "ahead", ffmpeg, &src);
+	CHECK(t, "open");
+	CHECK(read_n(t, got_pcm, 1024) == 1024, "playing");
+	CHECK(!seen().complete, "still downloading");
+	CHECK(track_seek(t, 18000) == 0, "seek ahead"); /* ~1 s has arrived */
+	long n = read_n(t, got_pcm, 4096);
+	float err;
+	long off = offset_of(ref, ref_frames, 18000L * 48, got_pcm, n, 960, 64, &err);
+	if (off != 0 || err != 0) fprintf(stderr, "seek ahead: %ld frames off, error %g\n", off, err);
+	CHECK(n == 4096 && off == 0 && err == 0, "lands on the sample when the bytes arrive");
+	track_close(t);
+	pthread_join(w.th, NULL);
+
+	/* 12. No decoder: open fails and leaves the fd to the caller. */
 	reset();
 	int p[2];
 	CHECK(pipe(p) == 0, "pipe");

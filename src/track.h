@@ -10,9 +10,10 @@
  * used. A download that is cut short can resume from where it stopped.
  * A `struct track *` is the host's stream handle.
  *
- * The length is exact once the download completes; it is then reported
- * through host->stream_update, but not before the host's first read(),
- * so the host has the handle in place when the report comes. */
+ * The length is exact once the download completes; it is then reported,
+ * with the track now seekable, through host->stream_update, but not
+ * before the host's first read(), so the host has the handle in place
+ * when the report comes. */
 
 #ifndef SPOTIFY_TRACK_H
 #define SPOTIFY_TRACK_H
@@ -54,6 +55,11 @@ struct track *track_open(const struct mm_host *h, const char *name, const char *
 
 /** mm_source_ops semantics. */
 long track_read(struct track *t, float *dst, uint32_t frames);
+/** To the sample, and the same samples as playing through: decoding
+ * restarts from memory a little before `ms` and is trimmed to it. A
+ * target past what has downloaded so far is reached when the bytes
+ * arrive. @returns 0, or -1 before any audio page has arrived. */
+int track_seek(struct track *t, uint64_t ms);
 void track_interrupt(struct track *t);
 void track_close(struct track *t);
 
