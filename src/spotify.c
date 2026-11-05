@@ -40,6 +40,7 @@
 #include <curl/curl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -266,6 +267,8 @@ static void sp_close(void *stream) { track_close(stream); }
  * progress pauses and resumes after. */
 static void tokens_refresh(const struct mm_host *h)
 {
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	struct fetch f;
 	memset(&f, 0, sizeof(f));
 	f.h = h;
@@ -284,6 +287,9 @@ static void tokens_refresh(const struct mm_host *h)
 		}
 	}
 	channel_give(&f);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	h->log(h, MM_LOG_DEBUG, "tokens refreshed in %ld ms",
+	       (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
 }
 
 static int spclient_ready(const struct mm_host *h, struct spclient *out, char *err, size_t errlen)
@@ -324,6 +330,19 @@ static const struct mm_source_ops source = {
 };
 
 /* ------------------------------------------------------------------ plugin */
+
+/* spclient's request lines, into the host log at debug level. */
+static const struct mm_host *g_debug_host;
+
+static void debug_line(const char *fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (g_debug_host) g_debug_host->log(g_debug_host, MM_LOG_DEBUG, "%s", line);
+}
 
 static void default_cache(char *out, size_t cap)
 {
@@ -393,6 +412,8 @@ static int spotify_init(const struct mm_host *h, void **priv)
 		free(sp);
 		return -1;
 	}
+	g_debug_host = h;
+	spclient_debug = debug_line;
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
 		free(sp);
 		return -1;
@@ -417,6 +438,8 @@ static void spotify_fini(void *priv)
 {
 	session_teardown();
 	lrc_stop();
+	spclient_debug = NULL;
+	spclient_cleanup();
 	curl_global_cleanup();
 	free(priv);
 }

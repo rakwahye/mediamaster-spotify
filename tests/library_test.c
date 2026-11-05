@@ -70,7 +70,7 @@ static void on_list(void *ctx, const char *uri, const char *name, const char *ow
 static int context(void)
 {
 	struct lib_tracks t = { NULL, 0, 0 };
-	char next[256];
+	struct lib_pages more = { NULL, 0, 0 };
 
 	CHECK(lib_parse_context(
 	          "{\"uri\":\"spotify:playlist:p\",\"metadata\":{\"context_description\":\"Mix\"},\"pages\":["
@@ -79,21 +79,27 @@ static int context(void)
 	          "{\"uri\":\"spotify:local:Artist:Album:Song:180\"},"
 	          "{\"uid\":\"no uri\"},"
 	          "{\"uri\":\"spotify:track:bbbbbbbbbbbbbbbbbbbbbb\"}]},"
+	          "{\"page_url\":\"hm://context-resolve/v1/page/xyz/1\"},"
 	          "{\"tracks\":[{\"uri\":\"spotify:track:cccccccccccccccccccccc\"}],"
 	          "\"next_page_url\":\"hm://context-resolve/v1/page/xyz?from=100\"}]}",
-	          &t, next, sizeof(next)) == 0, "a context");
+	          &t, &more) == 0, "a context");
 	CHECK(t.n == 3 && !strcmp(t.v[0].uri, "spotify:track:aaaaaaaaaaaaaaaaaaaaaa") &&
 	      !strcmp(t.v[2].uri, "spotify:track:cccccccccccccccccccccc"), "only tracks, across pages, in order");
-	CHECK(!strcmp(next, "context-resolve/v1/page/xyz?from=100"), "the next page as a spclient path");
+	CHECK(more.n == 2 && !strcmp(more.path[0], "context-resolve/v1/page/xyz/1") &&
+	      !strcmp(more.path[1], "context-resolve/v1/page/xyz?from=100"),
+	      "a track-less page's page_url and the next page, as spclient paths, in order");
+	lib_pages_free(&more);
 
 	CHECK(lib_parse_context("{\"tracks\":[{\"uri\":\"spotify:track:dddddddddddddddddddddd\"}],"
 	                        "\"nextPageUrl\":\"hm://context-resolve/v1/page/xyz?from=200\"}",
-	                        &t, next, sizeof(next)) == 0 && t.n == 4, "a later page on its own, camelCase");
-	CHECK(!strcmp(next, "context-resolve/v1/page/xyz?from=200"), "camelCase next");
-	CHECK(lib_parse_context("{\"pages\":[{\"tracks\":[]}]}", &t, next, sizeof(next)) == 0 && !next[0] && t.n == 4,
-	      "the last page: no next");
-	CHECK(lib_parse_context("not json", &t, next, sizeof(next)) != 0, "not JSON");
-	CHECK(lib_parse_context("{\"error\":1}", &t, next, sizeof(next)) != 0, "not a context");
+	                        &t, &more) == 0 && t.n == 4, "a later page on its own, camelCase");
+	CHECK(more.n == 1 && !strcmp(more.path[0], "context-resolve/v1/page/xyz?from=200"), "camelCase next");
+	lib_pages_free(&more);
+	CHECK(lib_parse_context("{\"pages\":[{\"tracks\":[],\"page_url\":\"https://elsewhere\"}]}", &t, &more) == 0 &&
+	      !more.n && t.n == 4, "the last page; a link that is not hm:// is not followed");
+	CHECK(lib_parse_context("not json", &t, &more) != 0, "not JSON");
+	CHECK(lib_parse_context("{\"error\":1}", &t, &more) != 0, "not a context");
+	lib_pages_free(&more);
 	lib_tracks_free(&t);
 	return 0;
 }

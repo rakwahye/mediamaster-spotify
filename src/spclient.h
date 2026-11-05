@@ -26,6 +26,13 @@ struct spclient {
 	time_t expires; /* when the access token stops working */
 };
 
+/** Where debug lines go (one per request: path, status, bytes, time);
+ * NULL for nowhere. Set once at startup. */
+extern void (*spclient_debug)(const char *fmt, ...);
+
+/** Close the connection kept for reuse. */
+void spclient_cleanup(void);
+
 /** Copy the session's spclient address and tokens. Call only between
  * librespot-c commands that leave the session alone, such as right after
  * librespotc_open returned while no other open can run (see lrc/tokens.c).

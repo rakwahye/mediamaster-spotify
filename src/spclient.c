@@ -1,16 +1,34 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /** @file spclient.c
- * @brief GET against spclient with libcurl. The headers are the ones
- * librespot-c sends for its own spclient requests. */
+ * @brief Requests to spclient with libcurl. The headers are the ones
+ * librespot-c sends for its own spclient requests.
+ *
+ * One curl handle is kept and requests take turns on it, so the TLS
+ * connection is reused: a list of a few pages and title batches costs
+ * one handshake, not one per request. */
 
 #include "spclient.h"
 #include <curl/curl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_BODY (8u << 20)
-#define TIMEOUT_MS 5000L
+#define TIMEOUT_MS 10000L
+
+void (*spclient_debug)(const char *fmt, ...);
+
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static CURL *g_curl; /* under g_lock */
+
+void spclient_cleanup(void)
+{
+	pthread_mutex_lock(&g_lock);
+	if (g_curl) curl_easy_cleanup(g_curl);
+	g_curl = NULL;
+	pthread_mutex_unlock(&g_lock);
+}
 
 static size_t collect(char *data, size_t size, size_t n, void *arg)
 {
@@ -33,13 +51,17 @@ static int request(const struct spclient *c, const char *path, const char *accep
 	struct curl_slist *hdr = NULL;
 	memset(r, 0, sizeof(*r));
 
-	CURL *curl = curl_easy_init();
+	pthread_mutex_lock(&g_lock);
+	if (!g_curl) g_curl = curl_easy_init();
+	CURL *curl = g_curl;
 	if (!curl) {
+		pthread_mutex_unlock(&g_lock);
 		snprintf(err, errlen, "curl unavailable");
 		return -1;
 	}
+	curl_easy_reset(curl); /* options only: the connection stays */
 	snprintf(url, sizeof(url), "https://%s:%u/%s", c->host, (unsigned)c->port, path);
-	snprintf(h_accept, sizeof(h_accept), "Accept: %s", accept);
+	snprintf(h_accept, sizeof(h_accept), "Accept: %s", accept ? accept : "*/*");
 	snprintf(h_auth, sizeof(h_auth), "Authorization: Bearer %s", c->access_token);
 	snprintf(h_client, sizeof(h_client), "Client-Token: %s", c->client_token);
 	hdr = curl_slist_append(hdr, h_accept);
@@ -61,9 +83,13 @@ static int request(const struct spclient *c, const char *path, const char *accep
 	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 
 	CURLcode rc = curl_easy_perform(curl);
+	double secs = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r->status);
+	curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &secs);
 	curl_slist_free_all(hdr);
-	curl_easy_cleanup(curl);
+	pthread_mutex_unlock(&g_lock);
+	if (spclient_debug)
+		spclient_debug("%s %.120s: %ld, %zu bytes, %.0f ms", type ? "POST" : "GET", path, r->status, r->len, secs * 1000);
 
 	if (rc != CURLE_OK)
 		snprintf(err, errlen, "%s: %s", path, curl_easy_strerror(rc));

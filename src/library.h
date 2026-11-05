@@ -40,10 +40,19 @@ struct lib_tracks {
 
 void lib_tracks_free(struct lib_tracks *t);
 
+/** Spclient paths of pages still to fetch, in order. */
+struct lib_pages {
+	char **path;
+	size_t n, cap;
+};
+
+void lib_pages_free(struct lib_pages *p);
+
 /** A context-resolve reply (a context, or one of its later pages): add
- * its tracks to t, and put the spclient path of the next page, or "",
- * into next. @returns 0, or -1 if it is not one. */
-int lib_parse_context(const char *json, struct lib_tracks *t, char *next, size_t nextcap);
+ * its tracks to t, and the spclient path of every page it only links to
+ * (page_url on a page without tracks, next_page_url) to `more`, in
+ * order. @returns 0, or -1 if it is not one. */
+int lib_parse_context(const char *json, struct lib_tracks *t, struct lib_pages *more);
 
 /** A rootlist reply: on_list(ctx, uri, name, owner) per playlist, in
  * order (folders flattened), and the full count into *total.

@@ -57,13 +57,29 @@ static json_object *member(json_object *o, const char *snake, const char *camel)
 	return NULL;
 }
 
-/* "hm://context-resolve/v1/..." → "context-resolve/v1/..." on spclient. */
-static void page_path(json_object *page, char *next, size_t cap)
+void lib_pages_free(struct lib_pages *p)
 {
-	json_object *u = member(page, "next_page_url", "nextPageUrl");
+	for (size_t i = 0; i < p->n; i++) free(p->path[i]);
+	free(p->path);
+	memset(p, 0, sizeof(*p));
+}
+
+/* "hm://context-resolve/v1/..." → "context-resolve/v1/..." on spclient. */
+static int link_to(json_object *page, const char *snake, const char *camel, struct lib_pages *more)
+{
+	json_object *u = member(page, snake, camel);
 	const char *s = u ? json_object_get_string(u) : NULL;
-	next[0] = '\0';
-	if (s && !strncmp(s, "hm://", 5)) snprintf(next, cap, "%s", s + 5);
+	if (!s || strncmp(s, "hm://", 5) != 0 || !s[5]) return 0;
+	if (more->n == more->cap) {
+		size_t cap = more->cap ? more->cap * 2 : 16;
+		char **v = realloc(more->path, cap * sizeof(*v));
+		if (!v) return -1;
+		more->path = v;
+		more->cap = cap;
+	}
+	if (!(more->path[more->n] = strdup(s + 5))) return -1;
+	more->n++;
+	return 0;
 }
 
 static int page_tracks(json_object *page, struct lib_tracks *t)
@@ -79,47 +95,62 @@ static int page_tracks(json_object *page, struct lib_tracks *t)
 	return 0;
 }
 
-int lib_parse_context(const char *json, struct lib_tracks *t, char *next, size_t nextcap)
+/* A page's tracks, or, for a page that only names where they are, that. */
+static int page(json_object *pg, struct lib_tracks *t, struct lib_pages *more)
+{
+	json_object *tracks = member(pg, "tracks", NULL);
+	int rc;
+	if (tracks && json_object_is_type(tracks, json_type_array) && json_object_array_length(tracks))
+		rc = page_tracks(pg, t);
+	else
+		rc = link_to(pg, "page_url", "pageUrl", more);
+	return rc ? rc : link_to(pg, "next_page_url", "nextPageUrl", more);
+}
+
+int lib_parse_context(const char *json, struct lib_tracks *t, struct lib_pages *more)
 {
 	json_object *root = json_tokener_parse(json);
 	int rc = -1;
-	next[0] = '\0';
 	if (!root || !json_object_is_type(root, json_type_object)) goto out;
 
 	json_object *pages = member(root, "pages", NULL);
 	if (pages && json_object_is_type(pages, json_type_array)) {
 		size_t n = json_object_array_length(pages);
 		rc = 0;
-		for (size_t i = 0; i < n && rc == 0; i++) {
-			json_object *page = json_object_array_get_idx(pages, i);
-			rc = page_tracks(page, t);
-			if (i == n - 1) page_path(page, next, nextcap);
-		}
+		for (size_t i = 0; i < n && rc == 0; i++) rc = page(json_object_array_get_idx(pages, i), t, more);
 	} else if (member(root, "tracks", NULL)) { /* a later page on its own */
-		rc = page_tracks(root, t);
-		page_path(root, next, nextcap);
+		rc = page(root, t, more);
 	}
 out:
 	json_object_put(root);
 	return rc;
 }
 
+/* The context, then each page it links to, depth-first in order: a
+ * linked page's own links come before the ones after it. */
+static int fetch_pages(const struct spclient *c, const char *path, struct lib_tracks *t, int *budget,
+                       char *err, size_t errlen)
+{
+	struct spclient_reply r;
+	struct lib_pages more = { NULL, 0, 0 };
+	if (--*budget < 0) return 0;
+	if (spclient_get(c, path, "application/json", &r, err, errlen) != 0) return -1;
+	int rc = lib_parse_context((const char *)r.body, t, &more);
+	free(r.body);
+	if (rc != 0) snprintf(err, errlen, "%s: not a context", path);
+	for (size_t i = 0; rc == 0 && i < more.n; i++) rc = fetch_pages(c, more.path[i], t, budget, err, errlen);
+	lib_pages_free(&more);
+	return rc;
+}
+
 static int context_tracks(const struct spclient *c, const char *uri, struct lib_tracks *t, char *err, size_t errlen)
 {
-	char path[2048], next[2048];
+	char path[1024];
+	int budget = MAX_PAGES;
 	snprintf(path, sizeof(path), "context-resolve/v1/%s", uri);
-	for (int page = 0; path[0] && page < MAX_PAGES; page++) {
-		struct spclient_reply r;
-		if (spclient_get(c, path, "application/json", &r, err, errlen) != 0) return -1;
-		int rc = lib_parse_context((const char *)r.body, t, next, sizeof(next));
-		free(r.body);
-		if (rc != 0) {
-			snprintf(err, errlen, "%s: not a context", path);
-			return -1;
-		}
-		snprintf(path, sizeof(path), "%s", next);
-	}
-	return 0;
+	int rc = fetch_pages(c, path, t, &budget, err, errlen);
+	if (spclient_debug) spclient_debug("%s: %zu tracks", uri, t->n);
+	return rc;
 }
 
 /* ------------------------------------------------------------------ rootlist */
