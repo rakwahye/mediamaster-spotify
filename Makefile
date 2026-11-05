@@ -37,8 +37,8 @@ CFLAGS ?= -O2 -g
 # The plugin: strict C99 against the host ABI and librespot-c's header.
 PLUG_CFLAGS := $(CFLAGS) -std=c99 -pedantic -Wall -Wextra -Wshadow \
                -Wstrict-prototypes -Wmissing-prototypes -D_POSIX_C_SOURCE=200809L \
-               -fPIC -fvisibility=hidden -I$(MM)/include -I$(LRC) \
-               $(shell pkg-config --cflags json-c)
+               -fPIC -fvisibility=hidden -I$(MM)/include -I$(LRC) -I$(LRC)/src \
+               $(shell pkg-config --cflags json-c libcurl libprotobuf-c)
 
 # librespot-c: its own dialect, its warnings are upstream's business.
 # The defines are what its configure would find on Linux/glibc; without
@@ -47,7 +47,11 @@ LRC_CFLAGS := $(CFLAGS) -std=gnu11 -w -fPIC -fvisibility=hidden -pthread \
               -D_GNU_SOURCE -DHAVE_SYS_UTSNAME_H -DHAVE_ENDIAN_H -DHAVE_PIPE2 \
               -I$(LRC) -I$(LRC)/src $(shell pkg-config --cflags $(PKGS))
 
-PLUG_OBJ := $(patsubst src/%.c,build/%.o,$(wildcard src/*.c))
+# src/lrc/: the few lines that read librespot-c's internals, built in its
+# dialect against its internal header (see src/lrc/tokens.c).
+LRC_INT_CFLAGS := $(filter-out -w,$(LRC_CFLAGS)) -Wall -Wextra -Wno-unused-parameter
+
+PLUG_OBJ := $(patsubst src/%.c,build/%.o,$(wildcard src/*.c src/lrc/*.c))
 LRC_OBJ  := $(patsubst %.c,build/%.o,$(wildcard $(LRC)/src/*.c $(LRC)/src/proto/*.c $(LRC)/src/shannon/*.c))
 
 .PHONY: all test install clean
@@ -60,6 +64,10 @@ build/spotify.so: $(PLUG_OBJ) $(LRC_OBJ)
 build/%.o: src/%.c src/*.h $(MM)/include/mm_plugin.h Makefile
 	@mkdir -p $(@D)
 	$(CC) $(PLUG_CFLAGS) -c $< -o $@
+
+build/lrc/%.o: src/lrc/%.c src/*.h Makefile
+	@mkdir -p $(@D)
+	$(CC) $(LRC_INT_CFLAGS) -c $< -o $@
 
 build/$(LRC)/%.o: $(LRC)/%.c Makefile
 	@mkdir -p $(@D)
@@ -85,8 +93,14 @@ build/tests/track: tests/track_test.c src/track.c src/ogg.c src/track.h src/ogg.
 	@mkdir -p $(@D)
 	$(CC) $(PLUG_CFLAGS) -Isrc tests/track_test.c src/track.c src/ogg.c -pthread -o $@
 
-test: all build/tests/creds build/tests/ogg build/tests/track build/tests/noise.ogg
+build/tests/meta: tests/meta_test.c src/meta.c src/spclient.c src/meta.h src/spclient.h Makefile
+	@mkdir -p $(@D)
+	$(CC) $(PLUG_CFLAGS) -Isrc tests/meta_test.c src/meta.c src/spclient.c $(LRC)/src/proto/metadata.pb-c.c \
+	      $(shell pkg-config --libs libcurl libprotobuf-c) -o $@
+
+test: all build/tests/creds build/tests/meta build/tests/ogg build/tests/track build/tests/noise.ogg
 	@build/tests/creds
+	@build/tests/meta
 	@build/tests/ogg build/tests/noise.ogg $(OGG_MS)
 	@build/tests/track ffmpeg build/tests/noise.ogg $(OGG_MS)
 	@$(MAKE) --no-print-directory -C $(MM) build/mediamaster build/mmctl

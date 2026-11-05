@@ -23,12 +23,17 @@
  *
  * Files: spotify.c (this: the plugin), session.c (the account),
  * creds.c (credentials.json), lrc.c (librespot-c glue), track.c (one
- * track: download, decode), ogg.c (Ogg page index). */
+ * track: download, decode), ogg.c (Ogg page index), spclient.c (Spotify's
+ * client API), meta.c (a track's tags), lrc/tokens.c (the session's
+ * tokens, from librespot-c's internals). */
 
 #include "mm_plugin.h"
 #include "lrc.h"
 #include "session.h"
 #include "track.h"
+#include "meta.h"
+#include "spclient.h"
+#include <curl/curl.h>
 #include "librespot-c.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -59,6 +64,23 @@ struct fetch {
 	struct track *t; /* NULL until track_open returns */
 	int cancelled;   /* the track is closing: never take the channel again */
 };
+
+/* The session's spclient address and tokens, refreshed on every open
+ * (librespot-c renews the token then if it is due). */
+static struct {
+	pthread_mutex_t lock;
+	struct spclient c;
+	int ok;
+} SPC = { PTHREAD_MUTEX_INITIALIZER, { "", 0, "", "" }, 0 };
+
+static int spclient_current(struct spclient *out)
+{
+	pthread_mutex_lock(&SPC.lock);
+	int ok = SPC.ok;
+	if (ok) *out = SPC.c;
+	pthread_mutex_unlock(&SPC.lock);
+	return ok ? 0 : -1;
+}
 
 static struct {
 	pthread_mutex_t lock;
@@ -113,6 +135,13 @@ static int fetch_start(struct fetch *f, size_t from, int fresh)
 	if ((fd = librespotc_open(f->uri, ss)) < 0) {
 		h->log(h, MM_LOG_WARN, "%s: %s", f->uri, librespotc_last_errmsg());
 		goto fail;
+	}
+	struct spclient c; /* safe to read now: see lrc/tokens.c */
+	if (spclient_from_session(ss, &c) == 0) {
+		pthread_mutex_lock(&SPC.lock);
+		SPC.c = c;
+		SPC.ok = 1;
+		pthread_mutex_unlock(&SPC.lock);
 	}
 	if (fresh) {
 		/* librespot-c does not reliably close the fd at the end, so the
@@ -203,6 +232,15 @@ static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_
 	pthread_cond_broadcast(&CH.changed);   /* a waiting play may want to */
 	pthread_mutex_unlock(&CH.lock);
 
+	/* What it is. Playback has started downloading; a failure here only
+	 * means the track plays untagged. */
+	struct spclient c;
+	struct meta m;
+	if (MM_HOST_HAS(h, stream_tags) && spclient_current(&c) == 0) {
+		if (meta_track(&c, uri, &m, err, sizeof(err)) == 0) h->stream_tags(h, t, m.kv);
+		else h->log(h, MM_LOG_INFO, "no tags: %s", err);
+	}
+
 	info->duration_ms = 0; /* known when the download completes */
 	info->flags = 0;
 	*stream = t;
@@ -292,13 +330,19 @@ static int spotify_init(const struct mm_host *h, void **priv)
 		free(sp);
 		return -1;
 	}
+	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+		free(sp);
+		return -1;
+	}
 	if (lrc_start(h, sp->cache) != 0) {
+		curl_global_cleanup();
 		free(sp);
 		return -1;
 	}
 	session_setup(sp->cache, h->config_get(h, "credentials"));
 	if (h->register_verb(h, "spotify", "[login|logout]\taccount state; log in or out", verb_spotify, sp) != 0) {
 		lrc_stop();
+		curl_global_cleanup();
 		free(sp);
 		return -1;
 	}
@@ -310,6 +354,7 @@ static void spotify_fini(void *priv)
 {
 	session_teardown();
 	lrc_stop();
+	curl_global_cleanup();
 	free(priv);
 }
 
