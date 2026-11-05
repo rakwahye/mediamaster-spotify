@@ -1,0 +1,3 @@
+[submodule "mediamaster"]
+	path = mediamaster
+	url = https://github.com/rakwahye/mediamaster
