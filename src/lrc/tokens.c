@@ -27,5 +27,6 @@ int spclient_from_session(struct sp_session *ss, struct spclient *out)
 	out->port = ss->spclient.port ? ss->spclient.port : 443;
 	snprintf(out->access_token, sizeof(out->access_token), "%s", ss->http_accesstoken.value);
 	snprintf(out->client_token, sizeof(out->client_token), "%s", ss->http_clienttoken.value);
+	out->expires = ss->http_accesstoken.received_ts + ss->http_accesstoken.expires_after_seconds;
 	return 0;
 }

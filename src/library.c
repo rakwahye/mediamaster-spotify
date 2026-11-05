@@ -1,0 +1,362 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/** @file library.c
+ * @brief Lists from spclient. Endpoint shapes as librespot (MIT) uses
+ * them in core/src/spclient.rs; message fields from its
+ * playlist4_external.proto and context*.proto, read here by hand. */
+
+#include "library.h"
+#include "pb.h"
+#include "proto/extended_metadata.pb-c.h"
+#include "proto/metadata.pb-c.h"
+#include <json-c/json.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define BATCH 100        /* tracks per extended-metadata request */
+#define MAX_PAGES 500    /* context pages followed */
+#define ROOTLIST_PAGE 120
+
+/* ------------------------------------------------------------------ tracks */
+
+void lib_tracks_free(struct lib_tracks *t)
+{
+	for (size_t i = 0; i < t->n; i++) {
+		free(t->v[i].uri);
+		free(t->v[i].title);
+		free(t->v[i].artist);
+		free(t->v[i].album);
+	}
+	free(t->v);
+	memset(t, 0, sizeof(*t));
+}
+
+static int tracks_add(struct lib_tracks *t, const char *uri)
+{
+	if (t->n == t->cap) {
+		size_t cap = t->cap ? t->cap * 2 : 128;
+		struct lib_track *v = realloc(t->v, cap * sizeof(*v));
+		if (!v) return -1;
+		t->v = v;
+		t->cap = cap;
+	}
+	memset(&t->v[t->n], 0, sizeof(t->v[t->n]));
+	if (!(t->v[t->n].uri = strdup(uri))) return -1;
+	t->n++;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ context-resolve */
+
+/* A key in snake_case, or the camelCase protobuf's JSON mapping uses. */
+static json_object *member(json_object *o, const char *snake, const char *camel)
+{
+	json_object *v = NULL;
+	if (json_object_object_get_ex(o, snake, &v)) return v;
+	if (camel && json_object_object_get_ex(o, camel, &v)) return v;
+	return NULL;
+}
+
+/* "hm://context-resolve/v1/..." → "context-resolve/v1/..." on spclient. */
+static void page_path(json_object *page, char *next, size_t cap)
+{
+	json_object *u = member(page, "next_page_url", "nextPageUrl");
+	const char *s = u ? json_object_get_string(u) : NULL;
+	next[0] = '\0';
+	if (s && !strncmp(s, "hm://", 5)) snprintf(next, cap, "%s", s + 5);
+}
+
+static int page_tracks(json_object *page, struct lib_tracks *t)
+{
+	json_object *tracks = member(page, "tracks", NULL);
+	size_t n = tracks && json_object_is_type(tracks, json_type_array) ? json_object_array_length(tracks) : 0;
+	for (size_t i = 0; i < n; i++) {
+		json_object *u = member(json_object_array_get_idx(tracks, i), "uri", NULL);
+		const char *s = u ? json_object_get_string(u) : NULL;
+		/* Episodes, local files and removed entries are not tracks we play. */
+		if (s && !strncmp(s, "spotify:track:", 14) && tracks_add(t, s) != 0) return -1;
+	}
+	return 0;
+}
+
+int lib_parse_context(const char *json, struct lib_tracks *t, char *next, size_t nextcap)
+{
+	json_object *root = json_tokener_parse(json);
+	int rc = -1;
+	next[0] = '\0';
+	if (!root || !json_object_is_type(root, json_type_object)) goto out;
+
+	json_object *pages = member(root, "pages", NULL);
+	if (pages && json_object_is_type(pages, json_type_array)) {
+		size_t n = json_object_array_length(pages);
+		rc = 0;
+		for (size_t i = 0; i < n && rc == 0; i++) {
+			json_object *page = json_object_array_get_idx(pages, i);
+			rc = page_tracks(page, t);
+			if (i == n - 1) page_path(page, next, nextcap);
+		}
+	} else if (member(root, "tracks", NULL)) { /* a later page on its own */
+		rc = page_tracks(root, t);
+		page_path(root, next, nextcap);
+	}
+out:
+	json_object_put(root);
+	return rc;
+}
+
+static int context_tracks(const struct spclient *c, const char *uri, struct lib_tracks *t, char *err, size_t errlen)
+{
+	char path[2048], next[2048];
+	snprintf(path, sizeof(path), "context-resolve/v1/%s", uri);
+	for (int page = 0; path[0] && page < MAX_PAGES; page++) {
+		struct spclient_reply r;
+		if (spclient_get(c, path, "application/json", &r, err, errlen) != 0) return -1;
+		int rc = lib_parse_context((const char *)r.body, t, next, sizeof(next));
+		free(r.body);
+		if (rc != 0) {
+			snprintf(err, errlen, "%s: not a context", path);
+			return -1;
+		}
+		snprintf(path, sizeof(path), "%s", next);
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ rootlist */
+
+#define MAX_LISTS 2000
+
+struct rootpage {
+	char uri[MAX_LISTS][96];
+	char name[MAX_LISTS][128];
+	char owner[MAX_LISTS][64];
+	int n_items, n_meta;
+};
+
+/* MetaItem: attributes (2) → ListAttributes name (1); owner_username (5). */
+static void meta_item(const struct pb_field *f, struct rootpage *rp)
+{
+	struct pb r = pb_of(f->data, f->len), a;
+	struct pb_field g, h;
+	int i = rp->n_meta++;
+	if (i >= MAX_LISTS) return;
+	while (pb_next(&r, &g) == 1) {
+		if (g.num == 2 && g.wire == 2) {
+			a = pb_of(g.data, g.len);
+			while (pb_next(&a, &h) == 1)
+				if (h.num == 1 && h.wire == 2) pb_str(&h, rp->name[i], sizeof(rp->name[i]));
+		} else if (g.num == 5 && g.wire == 2) {
+			pb_str(&g, rp->owner[i], sizeof(rp->owner[i]));
+		}
+	}
+}
+
+int lib_parse_rootlist(const uint8_t *body, size_t len,
+                       void (*on_list)(void *ctx, const char *uri, const char *name, const char *owner),
+                       void *ctx, int *total)
+{
+	struct rootpage *rp = calloc(1, sizeof(*rp));
+	struct pb r = pb_of(body, len), li, it;
+	struct pb_field f, g, h;
+	int rc = 0, ok;
+	if (!rp) return -1;
+	*total = 0;
+
+	/* SelectedListContent: length (2), contents (5) → ListItems:
+	 * items (3) → Item uri (1); meta_items (4), one per item. */
+	while (rc == 0 && (ok = pb_next(&r, &f)) != 0) {
+		if (ok < 0) { rc = -1; break; }
+		if (f.num == 2 && f.wire == 0) *total = (int)f.v;
+		if (f.num != 5 || f.wire != 2) continue;
+		li = pb_of(f.data, f.len);
+		while ((ok = pb_next(&li, &g)) == 1) {
+			if (g.num == 3 && g.wire == 2) {
+				it = pb_of(g.data, g.len);
+				while (pb_next(&it, &h) == 1)
+					if (h.num == 1 && h.wire == 2 && rp->n_items < MAX_LISTS)
+						pb_str(&h, rp->uri[rp->n_items], sizeof(rp->uri[0]));
+				rp->n_items++;
+			} else if (g.num == 4 && g.wire == 2) {
+				meta_item(&g, rp);
+			}
+		}
+		if (ok < 0) rc = -1;
+	}
+	for (int i = 0; rc == 0 && i < rp->n_items && i < MAX_LISTS; i++) {
+		/* Folders arrive as start-group / end-group markers: flattened. */
+		if (strncmp(rp->uri[i], "spotify:playlist:", 17) != 0) continue;
+		on_list(ctx, rp->uri[i], i < rp->n_meta ? rp->name[i] : "", i < rp->n_meta ? rp->owner[i] : "");
+	}
+	free(rp);
+	return rc;
+}
+
+struct emit_ctx { mm_item_fn emit; void *ctx; int stop; int count; };
+
+static void emit_list(void *arg, const char *uri, const char *name, const char *owner)
+{
+	struct emit_ctx *e = arg;
+	struct mm_item it = { MM_ITEM_LIST, uri, name[0] ? name : NULL, owner[0] ? owner : NULL, NULL, 0 };
+	e->count++;
+	if (!e->stop) e->stop = e->emit(e->ctx, &it) != 0;
+}
+
+static int rootlist(const struct spclient *c, const char *user, struct emit_ctx *e, char *err, size_t errlen)
+{
+	char path[512];
+	int total = 0;
+	for (int from = 0; !e->stop; from += ROOTLIST_PAGE) {
+		struct spclient_reply r;
+		snprintf(path, sizeof(path),
+		         "playlist/v2/user/%s/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code"
+		         "&from=%d&length=%d", user, from, ROOTLIST_PAGE);
+		if (spclient_get(c, path, "application/x-protobuf", &r, err, errlen) != 0) return -1;
+		int before = e->count;
+		int rc = lib_parse_rootlist(r.body, r.len, emit_list, e, &total);
+		free(r.body);
+		if (rc != 0) {
+			snprintf(err, errlen, "your playlists: not a rootlist");
+			return -1;
+		}
+		if (e->count == before || from + ROOTLIST_PAGE >= total) break;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ titles */
+
+static char *join_artists(Artist **a, size_t n)
+{
+	size_t len = 1;
+	for (size_t i = 0; i < n; i++) len += (a[i]->name ? strlen(a[i]->name) : 0) + 2;
+	char *s = malloc(len), *p = s;
+	if (!s) return NULL;
+	*p = '\0';
+	for (size_t i = 0; i < n; i++) {
+		if (!a[i]->name || !*a[i]->name) continue;
+		p += sprintf(p, "%s%s", p == s ? "" : ", ", a[i]->name);
+	}
+	return s;
+}
+
+static struct lib_track *find(struct lib_tracks *t, const char *uri, size_t *hint)
+{
+	for (size_t k = 0; k < t->n; k++) {
+		size_t i = (*hint + k) % t->n; /* replies come in request order */
+		if (!strcmp(t->v[i].uri, uri)) {
+			*hint = i + 1;
+			return &t->v[i];
+		}
+	}
+	return NULL;
+}
+
+int lib_parse_batch(const uint8_t *body, size_t len, struct lib_tracks *t)
+{
+	Spotify__Extendedmetadata__BatchedExtensionResponse *res =
+		spotify__extendedmetadata__batched_extension_response__unpack(NULL, len, body);
+	size_t hint = 0;
+	if (!res) return -1;
+	for (size_t i = 0; i < res->n_extended_metadata; i++) {
+		const Spotify__Extendedmetadata__EntityExtensionDataArray *arr = res->extended_metadata[i];
+		for (size_t j = 0; j < arr->n_extension_data; j++) {
+			const Spotify__Extendedmetadata__EntityExtensionData *d = arr->extension_data[j];
+			struct lib_track *e;
+			if (!d->entity_uri || !d->extension_data || (d->header && d->header->status_code != 200)) continue;
+			if (!(e = find(t, d->entity_uri, &hint)) || e->title) continue;
+			Track *tr = track__unpack(NULL, d->extension_data->value.len, d->extension_data->value.data);
+			if (!tr) continue;
+			if (tr->name) e->title = strdup(tr->name);
+			e->artist = join_artists(tr->artist, tr->n_artist);
+			if (tr->album && tr->album->name) e->album = strdup(tr->album->name);
+			if (tr->has_duration && tr->duration > 0) e->duration_ms = (uint64_t)tr->duration;
+			track__free_unpacked(tr, NULL);
+		}
+	}
+	spotify__extendedmetadata__batched_extension_response__free_unpacked(res, NULL);
+	return 0;
+}
+
+/* Titles for t[from, from + n). A failure leaves them untitled. */
+static int titles(const struct spclient *c, struct lib_tracks *t, size_t from, size_t n, char *err, size_t errlen)
+{
+	Spotify__Extendedmetadata__ExtensionQuery q = SPOTIFY__EXTENDEDMETADATA__EXTENSION_QUERY__INIT;
+	Spotify__Extendedmetadata__ExtensionQuery *qs[1] = { &q };
+	Spotify__Extendedmetadata__EntityRequest er[BATCH];
+	Spotify__Extendedmetadata__EntityRequest *ers[BATCH];
+	Spotify__Extendedmetadata__BatchedEntityRequest req = SPOTIFY__EXTENDEDMETADATA__BATCHED_ENTITY_REQUEST__INIT;
+	struct spclient_reply r;
+
+	q.extension_kind = SPOTIFY__EXTENDEDMETADATA__EXTENSION_KIND__TRACK_V4;
+	for (size_t i = 0; i < n; i++) {
+		Spotify__Extendedmetadata__EntityRequest init = SPOTIFY__EXTENDEDMETADATA__ENTITY_REQUEST__INIT;
+		er[i] = init;
+		er[i].entity_uri = t->v[from + i].uri;
+		er[i].n_query = 1;
+		er[i].query = qs;
+		ers[i] = &er[i];
+	}
+	req.n_entity_request = n;
+	req.entity_request = ers;
+
+	size_t len = spotify__extendedmetadata__batched_entity_request__get_packed_size(&req);
+	uint8_t *body = malloc(len);
+	if (!body) return -1;
+	spotify__extendedmetadata__batched_entity_request__pack(&req, body);
+	int rc = spclient_post(c, "extended-metadata/v0/extended-metadata", "application/x-protobuf",
+	                       "application/x-protobuf", body, len, &r, err, errlen);
+	free(body);
+	if (rc != 0) return -1;
+	rc = lib_parse_batch(r.body, r.len, t);
+	free(r.body);
+	return rc;
+}
+
+/* ------------------------------------------------------------------ list */
+
+int library_is_list(const char *uri)
+{
+	static const char *const prefixes[] = {
+		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", NULL
+	};
+	if (!strcmp(uri, "spotify:") || !strcmp(uri, "spotify:collection")) return 1;
+	for (const char *const *p = prefixes; *p; p++)
+		if (!strncmp(uri, *p, strlen(*p)) && uri[strlen(*p)]) return 1;
+	return 0;
+}
+
+int library_list(const struct spclient *c, const char *user, const char *uri, uint32_t flags,
+                 mm_item_fn emit, void *ctx, char *err, size_t errlen)
+{
+	char context[512];
+	struct emit_ctx e = { emit, ctx, 0, 0 };
+
+	if (!library_is_list(uri)) return MM_NOT_A_LIST;
+	if (!strcmp(uri, "spotify:")) {
+		struct mm_item liked = { MM_ITEM_LIST, "spotify:collection", "Liked Songs", user, NULL, 0 };
+		if (emit(ctx, &liked) != 0) return 0;
+		return rootlist(c, user, &e, err, errlen);
+	}
+	if (!strcmp(uri, "spotify:collection"))
+		snprintf(context, sizeof(context), "spotify:user:%s:collection", user);
+	else
+		snprintf(context, sizeof(context), "%s", uri);
+
+	struct lib_tracks t = { NULL, 0, 0 };
+	if (context_tracks(c, context, &t, err, errlen) != 0) {
+		lib_tracks_free(&t);
+		return -1;
+	}
+	if (!(flags & MM_LIST_URIS)) {
+		char why[256];
+		for (size_t i = 0; i < t.n; i += BATCH)
+			if (titles(c, &t, i, t.n - i < BATCH ? t.n - i : BATCH, why, sizeof(why)) != 0) break;
+	}
+	for (size_t i = 0; i < t.n; i++) {
+		const struct lib_track *k = &t.v[i];
+		struct mm_item it = { MM_ITEM_TRACK, k->uri, k->title, k->artist, k->album, k->duration_ms };
+		if (emit(ctx, &it) != 0) break;
+	}
+	lib_tracks_free(&t);
+	return 0;
+}

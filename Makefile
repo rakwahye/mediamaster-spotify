@@ -98,9 +98,18 @@ build/tests/meta: tests/meta_test.c src/meta.c src/spclient.c src/meta.h src/spc
 	$(CC) $(PLUG_CFLAGS) -Isrc tests/meta_test.c src/meta.c src/spclient.c $(LRC)/src/proto/metadata.pb-c.c \
 	      $(shell pkg-config --libs libcurl libprotobuf-c) -o $@
 
-test: all build/tests/creds build/tests/meta build/tests/ogg build/tests/track build/tests/noise.ogg
+PROTO := $(addprefix $(LRC)/src/proto/,metadata.pb-c.c extended_metadata.pb-c.c \
+           entity_extension_data.pb-c.c extension_kind.pb-c.c google_any.pb-c.c)
+
+build/tests/library: tests/library_test.c src/library.c src/pb.c src/spclient.c src/*.h Makefile
+	@mkdir -p $(@D)
+	$(CC) $(PLUG_CFLAGS) -Isrc tests/library_test.c src/library.c src/pb.c src/spclient.c $(PROTO) \
+	      $(shell pkg-config --libs json-c libcurl libprotobuf-c) -o $@
+
+test: all build/tests/creds build/tests/meta build/tests/library build/tests/ogg build/tests/track build/tests/noise.ogg
 	@build/tests/creds
 	@build/tests/meta
+	@build/tests/library
 	@build/tests/ogg build/tests/noise.ogg $(OGG_MS)
 	@build/tests/track ffmpeg build/tests/noise.ogg $(OGG_MS)
 	@$(MAKE) --no-print-directory -C $(MM) build/mediamaster build/mmctl

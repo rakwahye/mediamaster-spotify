@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 struct sp_session;
 
@@ -22,6 +23,7 @@ struct spclient {
 	unsigned short port;
 	char access_token[512];
 	char client_token[512];
+	time_t expires; /* when the access token stops working */
 };
 
 /** Copy the session's spclient address and tokens. Call only between
@@ -41,5 +43,10 @@ struct spclient_reply {
  * if any, is freed). */
 int spclient_get(const struct spclient *c, const char *path, const char *accept,
                  struct spclient_reply *r, char *err, size_t errlen);
+
+/** POST `body` (a `type`, e.g. application/x-protobuf) to path; as
+ * spclient_get otherwise. */
+int spclient_post(const struct spclient *c, const char *path, const char *accept, const char *type,
+                  const void *body, size_t len, struct spclient_reply *r, char *err, size_t errlen);
 
 #endif

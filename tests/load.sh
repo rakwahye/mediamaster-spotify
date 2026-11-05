@@ -56,8 +56,14 @@ if "$M" spotify bogus >/dev/null 2>&1; then fail "unknown subcommand accepted"; 
 out=$("$M" play spotify:track:4uLU6hMCjMI75M1A2tKUQC 2>&1) && fail "play without credentials succeeded"
 echo "$out" | grep -q "spotify could not open" || fail "play without credentials: $out"
 grep -q "no credentials" "$T/log" || fail "play did not try to log in"
-out=$("$M" play spotify:album:1 2>&1) && fail "album played as a track"
-grep -q "not a track: spotify:album:1" "$T/log" || fail "non-track URI: $out"
+out=$("$M" play spotify:episode:1 2>&1) && fail "episode played as a track"
+grep -q "not a track: spotify:episode:1" "$T/log" || fail "non-track URI: $out"
+
+# The catalog: a track is not a list (no network); lists need a login.
+"$M" browse spotify:track:4uLU6hMCjMI75M1A2tKUQC 2>&1 | grep -q "is a track" || fail "browse of a track"
+out=$("$M" browse spotify: 2>&1) && fail "browse without credentials succeeded"
+echo "$out" | grep -q "no credentials" || fail "browse without credentials: $out"
+"$M" plugins | grep -q '^spotify .*ifaces=source,catalog' || fail "catalog not listed: $("$M" plugins)"
 stop
 
 # Imported credentials that Spotify will not take (here: cannot reach it).

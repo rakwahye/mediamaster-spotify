@@ -29,6 +29,9 @@ void session_logout(void);
 /** One line: "logged in as X", "logged out", "login failed: ...". */
 void session_describe(char *out, size_t cap);
 
+/** The account's username into out. @returns 0, or -1 if logged out. */
+int session_username(char *out, size_t cap);
+
 /** The live librespot-c session, or NULL. Valid until logout. */
 struct sp_session *session_get(void);
 

@@ -96,6 +96,15 @@ void session_describe(char *out, size_t cap)
 	pthread_mutex_unlock(&S.lock);
 }
 
+int session_username(char *out, size_t cap)
+{
+	pthread_mutex_lock(&S.lock);
+	int ok = S.sp != NULL;
+	if (ok) snprintf(out, cap, "%s", S.username);
+	pthread_mutex_unlock(&S.lock);
+	return ok ? 0 : -1;
+}
+
 struct sp_session *session_get(void)
 {
 	pthread_mutex_lock(&S.lock);

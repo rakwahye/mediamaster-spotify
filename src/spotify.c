@@ -15,7 +15,8 @@
  *                                  log in with until mediamaster has its own
  *   spotify.ffmpeg = <bin>         decoder (default ffmpeg)
  *
- * Plays spotify:track:<id>. Logs in on the first play if not logged in.
+ * Plays spotify:track:<id>; lists your library, playlists, albums and
+ * artists (library.c). Logs in on first use if not logged in.
  *
  * Commands:
  *   spotify                  account state, cache location, library version
@@ -24,24 +25,27 @@
  * Files: spotify.c (this: the plugin), session.c (the account),
  * creds.c (credentials.json), lrc.c (librespot-c glue), track.c (one
  * track: download, decode), ogg.c (Ogg page index), spclient.c (Spotify's
- * client API), meta.c (a track's tags), lrc/tokens.c (the session's
- * tokens, from librespot-c's internals). */
+ * client API), meta.c (a track's tags), library.c (lists), pb.c (protobuf
+ * wire format), lrc/tokens.c (the session's tokens, from librespot-c's
+ * internals). */
 
 #include "mm_plugin.h"
-#include "lrc.h"
-#include "session.h"
-#include "track.h"
-#include "meta.h"
-#include "spclient.h"
-#include <curl/curl.h>
 #include "librespot-c.h"
+#include "library.h"
+#include "lrc.h"
+#include "meta.h"
+#include "session.h"
+#include "spclient.h"
+#include "track.h"
+#include <curl/curl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 struct spotify {
 	const struct mm_host *h;
@@ -71,7 +75,7 @@ static struct {
 	pthread_mutex_t lock;
 	struct spclient c;
 	int ok;
-} SPC = { PTHREAD_MUTEX_INITIALIZER, { "", 0, "", "" }, 0 };
+} SPC = { PTHREAD_MUTEX_INITIALIZER, { "", 0, "", "", 0 }, 0 };
 
 static int spclient_current(struct spclient *out)
 {
@@ -252,6 +256,65 @@ static int sp_seek(void *stream, uint64_t ms) { return track_seek(stream, ms); }
 static void sp_interrupt(void *stream) { track_interrupt(stream); }
 static void sp_close(void *stream) { track_close(stream); }
 
+/* ------------------------------------------------------------------ tokens
+ *
+ * librespot-c fetches its spclient tokens while opening a track, and only
+ * then. To list before anything has played, or once the token has aged,
+ * open a track id that does not exist: the tokens come first, the lookup
+ * then fails, and the session stays logged in (it reconnects for the next
+ * track). The open takes the channel like a new play, so a download in
+ * progress pauses and resumes after. */
+static void tokens_refresh(const struct mm_host *h)
+{
+	struct fetch f;
+	memset(&f, 0, sizeof(f));
+	f.h = h;
+	snprintf(f.uri, sizeof(f.uri), "spotify:track:0000000000000000000000");
+	if (channel_take(&f, 1) != 0) return;
+	struct sp_session *ss = session_get();
+	struct spclient c;
+	if (ss) {
+		int fd = librespotc_open(f.uri, ss);
+		if (fd >= 0) librespotc_close(fd);
+		if (spclient_from_session(ss, &c) == 0) { /* safe: see lrc/tokens.c */
+			pthread_mutex_lock(&SPC.lock);
+			SPC.c = c;
+			SPC.ok = 1;
+			pthread_mutex_unlock(&SPC.lock);
+		}
+	}
+	channel_give(&f);
+}
+
+static int spclient_ready(const struct mm_host *h, struct spclient *out, char *err, size_t errlen)
+{
+	if (spclient_current(out) == 0 && out->expires > time(NULL) + 60) return 0;
+	tokens_refresh(h);
+	if (spclient_current(out) == 0 && out->expires > time(NULL)) return 0;
+	snprintf(err, errlen, "Spotify gave no token (details in the debug log)");
+	return -1;
+}
+
+/* ------------------------------------------------------------------ catalog */
+
+static int sp_list(void *priv, const char *uri, uint32_t flags, mm_item_fn emit, void *ctx,
+                   char *err, size_t errlen)
+{
+	const struct spotify *sp = priv;
+	struct spclient c;
+	char user[64];
+
+	if (!library_is_list(uri)) return MM_NOT_A_LIST; /* tracks, episodes: no network */
+	if (session_login(err, errlen) != 0 || spclient_ready(sp->h, &c, err, errlen) != 0) return -1;
+	if (session_username(user, sizeof(user)) != 0) {
+		snprintf(err, errlen, "logged out");
+		return -1;
+	}
+	return library_list(&c, user, uri, flags, emit, ctx, err, errlen);
+}
+
+static const struct mm_catalog_ops catalog = { .list = sp_list };
+
 static const struct mm_source_ops source = {
 	.open      = sp_open,
 	.read      = sp_read,
@@ -369,6 +432,7 @@ static const struct mm_plugin plugin = {
 	.init        = spotify_init,
 	.fini        = spotify_fini,
 	.source      = &source,
+	.catalog     = &catalog,
 };
 
 MM_PLUGIN_DEFINE(spotify)

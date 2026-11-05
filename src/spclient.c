@@ -26,10 +26,10 @@ static size_t collect(char *data, size_t size, size_t n, void *arg)
 	return add;
 }
 
-int spclient_get(const struct spclient *c, const char *path, const char *accept,
-                 struct spclient_reply *r, char *err, size_t errlen)
+static int request(const struct spclient *c, const char *path, const char *accept, const char *type,
+                   const void *body, size_t len, struct spclient_reply *r, char *err, size_t errlen)
 {
-	char url[1024], h_accept[128], h_auth[600], h_client[600];
+	char url[2048], h_accept[128], h_type[128], h_auth[600], h_client[600];
 	struct curl_slist *hdr = NULL;
 	memset(r, 0, sizeof(*r));
 
@@ -45,6 +45,12 @@ int spclient_get(const struct spclient *c, const char *path, const char *accept,
 	hdr = curl_slist_append(hdr, h_accept);
 	hdr = curl_slist_append(hdr, h_auth);
 	hdr = curl_slist_append(hdr, h_client);
+	if (type) {
+		snprintf(h_type, sizeof(h_type), "Content-Type: %s", type);
+		hdr = curl_slist_append(hdr, h_type);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)len);
+	}
 
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr);
@@ -69,4 +75,16 @@ int spclient_get(const struct spclient *c, const char *path, const char *accept,
 	r->body = NULL;
 	r->len = 0;
 	return -1;
+}
+
+int spclient_get(const struct spclient *c, const char *path, const char *accept,
+                 struct spclient_reply *r, char *err, size_t errlen)
+{
+	return request(c, path, accept, NULL, NULL, 0, r, err, errlen);
+}
+
+int spclient_post(const struct spclient *c, const char *path, const char *accept, const char *type,
+                  const void *body, size_t len, struct spclient_reply *r, char *err, size_t errlen)
+{
+	return request(c, path, accept, type, body, len, r, err, errlen);
 }
