@@ -275,6 +275,20 @@ static int collection(void)
 	return 0;
 }
 
+static int search(void)
+{
+	char u[128];
+	lib_search_uri("daft punk", u, sizeof(u));
+	CHECK(!strcmp(u, "spotify:search:daft+punk"), "spaces as +");
+	lib_search_uri("AC/DC & co.~_-", u, sizeof(u));
+	CHECK(!strcmp(u, "spotify:search:AC%2FDC+%26+co.~_-"), "reserved characters encoded");
+	lib_search_uri("Bj\xc3\xb6rk", u, sizeof(u));
+	CHECK(!strcmp(u, "spotify:search:Bj%C3%B6rk"), "UTF-8 byte by byte");
+	CHECK(library_is_list("spotify:search:x") && !library_is_list("spotify:search:") &&
+	      !library_is_list("spotify:track:x") && library_is_list("spotify:collection:artists"), "which URIs are lists");
+	return 0;
+}
+
 static int wire(void)
 {
 	static const uint8_t bad_len[] = { 0x0a, 0x05, 'a' };       /* length past the end */
@@ -295,7 +309,7 @@ static int wire(void)
 
 int main(void)
 {
-	if (context() || rootlist() || batch() || collection() || wire()) return 1;
+	if (context() || rootlist() || batch() || collection() || search() || wire()) return 1;
 	printf("library: all checks passed\n");
 	return 0;
 }

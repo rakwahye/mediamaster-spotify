@@ -148,10 +148,10 @@ static int fetch_pages(const struct spclient *c, const char *path, struct lib_tr
 	return rc;
 }
 
-static int context_tracks(const struct spclient *c, const char *uri, struct lib_tracks *t, char *err, size_t errlen)
+static int context_tracks(const struct spclient *c, const char *uri, int budget, struct lib_tracks *t,
+                          char *err, size_t errlen)
 {
 	char path[1024];
-	int budget = MAX_PAGES;
 	snprintf(path, sizeof(path), "context-resolve/v1/%s", uri);
 	int rc = fetch_pages(c, path, t, &budget, err, errlen);
 	if (spclient_debug) spclient_debug("%s: %zu tracks", uri, t->n);
@@ -436,6 +436,26 @@ static int titles(const struct spclient *c, enum lib_kind kind, struct lib_track
 
 /* ------------------------------------------------------------------ list */
 
+/* "daft punk!" → "spotify:search:daft+punk%21", as Spotify's apps write it. */
+void lib_search_uri(const char *words, char *out, size_t cap)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t o = (size_t)snprintf(out, cap, "spotify:search:");
+	for (const unsigned char *p = (const unsigned char *)words; *p && o + 4 < cap; p++) {
+		if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+		    *p == '-' || *p == '_' || *p == '.' || *p == '~')
+			out[o++] = (char)*p;
+		else if (*p == ' ')
+			out[o++] = '+';
+		else {
+			out[o++] = '%';
+			out[o++] = hex[*p >> 4];
+			out[o++] = hex[*p & 15];
+		}
+	}
+	out[o] = '\0';
+}
+
 /* Name t's entries if wanted, emit them, free them. */
 static int hand_over(const struct spclient *c, enum lib_kind kind, struct lib_tracks *t, uint32_t flags,
                      mm_item_fn emit, void *ctx)
@@ -473,7 +493,7 @@ static int saved(const struct spclient *c, const char *user, const char *set, co
 int library_is_list(const char *uri)
 {
 	static const char *const prefixes[] = {
-		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", NULL
+		"spotify:playlist:", "spotify:album:", "spotify:artist:", "spotify:user:", "spotify:search:", NULL
 	};
 	if (!strcmp(uri, "spotify:") || !strcmp(uri, "spotify:collection") ||
 	    !strcmp(uri, "spotify:collection:albums") || !strcmp(uri, "spotify:collection:artists"))
@@ -507,13 +527,18 @@ int library_list(const struct spclient *c, const char *user, const char *uri, ui
 		return saved(c, user, albums ? "collection" : "artist", albums ? "spotify:album:" : "spotify:artist:",
 		             albums ? LIB_ALBUM : LIB_ARTIST, flags, emit, ctx, err, errlen);
 	}
-	if (!strcmp(uri, "spotify:collection"))
+	int budget = MAX_PAGES;
+	if (!strcmp(uri, "spotify:collection")) {
 		snprintf(context, sizeof(context), "spotify:user:%s:collection", user);
-	else
+	} else if (!strncmp(uri, "spotify:search:", 15)) {
+		lib_search_uri(uri + 15, context, sizeof(context));
+		budget = 1; /* the best matches; the rest is noise */
+	} else {
 		snprintf(context, sizeof(context), "%s", uri);
+	}
 
 	struct lib_tracks t = { NULL, 0, 0 };
-	if (context_tracks(c, context, &t, err, errlen) != 0) {
+	if (context_tracks(c, context, budget, &t, err, errlen) != 0) {
 		lib_tracks_free(&t);
 		return -1;
 	}

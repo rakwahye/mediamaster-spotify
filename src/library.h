@@ -10,6 +10,7 @@
  *   spotify:playlist:<id>    a playlist's tracks
  *   spotify:album:<id>       an album's tracks
  *   spotify:artist:<id>      an artist's top tracks and latest release
+ *   spotify:search:<words>   what Spotify's search finds (first page)
  *
  * Tracks come from context-resolve, the endpoint Spotify's apps fill a
  * play context from (JSON, paged); your playlists from your rootlist
@@ -31,6 +32,10 @@ int library_list(const struct spclient *c, const char *user, const char *uri, ui
                  mm_item_fn emit, void *ctx, char *err, size_t errlen);
 
 /* ---- the parsers, split out for tests ---- */
+
+/** Words → "spotify:search:<words>" as Spotify's apps write it: spaces
+ * as '+', anything not unreserved percent-encoded. */
+void lib_search_uri(const char *words, char *out, size_t cap);
 
 /* A track, or for the collection's lists an album or artist. */
 struct lib_track {
