@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Load the plugin into the pinned mediamaster and check it comes up.
+# Spotify itself is not needed: login is exercised up to its failure.
 # Usage: tests/load.sh <mediamaster-build-dir> <plugin-build-dir>
 set -eu
 
@@ -18,25 +19,57 @@ exports=$(nm -D --defined-only "$PLUG/spotify.so" | awk '{print $3}')
 
 export MM_SOCK="$T/mm.sock"
 M="$HOST/mmctl"
+C="$T/cache"
 
-"$HOST/mediamaster" -c /dev/null -o "host.socket=$MM_SOCK" -o "host.plugin_dir=$PLUG" \
-	-o host.sink=null -o "spotify.cache=$T/cache" 2>"$T/log" &
-PID=$!
-i=0
-until "$M" version >/dev/null 2>&1; do
-	i=$((i + 1)); [ $i -lt 50 ] || fail "daemon did not answer"
-	sleep 0.1
-done
+start() {
+	"$HOST/mediamaster" -c /dev/null -o "host.socket=$MM_SOCK" -o "host.plugin_dir=$PLUG" \
+		-o host.sink=null -o "spotify.cache=$C" "$@" 2>>"$T/log" &
+	PID=$!
+	i=0
+	until "$M" version >/dev/null 2>&1; do
+		i=$((i + 1)); [ $i -lt 50 ] || fail "daemon did not answer"
+		sleep 0.1
+	done
+}
+stop() {
+	"$M" quit >/dev/null
+	wait "$PID" || fail "daemon exit status"
+	PID=
+}
 
+start
 "$M" plugins | grep -q "^spotify .*active.*attrs=network,login,rate-limited,unofficial-api .*spotify.so$" \
 	|| fail "spotify.so is not active with its attributes"
-[ "$("$M" spotify)" = "ok logged out, cache $T/cache, librespot-c 0.9" ] || fail "spotify verb: $("$M" spotify)"
+[ "$("$M" spotify)" = "ok logged out, cache $C, librespot-c 0.9" ] || fail "status: $("$M" spotify)"
 
-mkdir -p "$T/cache"
-: >"$T/cache/credentials"
-[ "$("$M" spotify)" = "ok logged in, cache $T/cache, librespot-c 0.9" ] || fail "credentials not noticed"
+# A stable device id, created once.
+id=$(cat "$C/device_id")
+echo "$id" | grep -qx '[0-9a-f]\{40\}' || fail "device_id: $id"
 
-"$M" quit >/dev/null
-wait "$PID" || fail "daemon exit status"
-PID=
+# No credentials anywhere: a clear error, no network.
+out=$("$M" spotify login 2>&1) && fail "login without credentials succeeded"
+echo "$out" | grep -q "no credentials: set spotify.credentials" || fail "login without credentials: $out"
+if "$M" spotify bogus >/dev/null 2>&1; then fail "unknown subcommand accepted"; fi
+stop
+
+# Imported credentials that Spotify will not take (here: cannot reach it).
+printf '{"username":"someone","auth_type":1,"auth_data":"AQID"}' >"$T/import.json"
+cp "$T/import.json" "$T/import.orig"
+start -o "spotify.credentials=$T/import.json"
+[ "$(cat "$C/device_id")" = "$id" ] || fail "device_id changed across restarts"
+t0=$(date +%s)
+out=$("$M" spotify login 2>&1) && fail "a bogus login succeeded"
+[ $(( $(date +%s) - t0 )) -le 30 ] || fail "a failing login took more than 30 s"
+echo "$out" | grep -q "^err login failed: " || fail "failed login: $out"
+"$M" spotify | grep -q "^ok logged out (login failed: " || fail "status after failure: $("$M" spotify)"
+cmp -s "$T/import.json" "$T/import.orig" || fail "the imported file was modified"
+[ ! -e "$C/credentials.json" ] || fail "credentials saved after a failed login"
+
+# Logout removes mediamaster's own saved login, never the import.
+printf '{"username":"x","auth_type":1,"auth_data":"AQID"}' >"$C/credentials.json"
+[ "$("$M" spotify logout)" = "ok logged out" ] || fail "logout"
+[ ! -e "$C/credentials.json" ] || fail "logout left the saved credentials"
+[ -e "$T/import.json" ] || fail "logout touched the imported file"
+stop
+
 echo "load: all checks passed"

@@ -36,7 +36,8 @@ CFLAGS ?= -O2 -g
 # The plugin: strict C99 against the host ABI and librespot-c's header.
 PLUG_CFLAGS := $(CFLAGS) -std=c99 -pedantic -Wall -Wextra -Wshadow \
                -Wstrict-prototypes -Wmissing-prototypes -D_POSIX_C_SOURCE=200809L \
-               -fPIC -fvisibility=hidden -I$(MM)/include -I$(LRC)
+               -fPIC -fvisibility=hidden -I$(MM)/include -I$(LRC) \
+               $(shell pkg-config --cflags json-c)
 
 # librespot-c: its own dialect, its warnings are upstream's business.
 # The defines are what its configure would find on Linux/glibc; without
@@ -45,7 +46,7 @@ LRC_CFLAGS := $(CFLAGS) -std=gnu11 -w -fPIC -fvisibility=hidden -pthread \
               -D_GNU_SOURCE -DHAVE_SYS_UTSNAME_H -DHAVE_ENDIAN_H -DHAVE_PIPE2 \
               -I$(LRC) -I$(LRC)/src $(shell pkg-config --cflags $(PKGS))
 
-PLUG_OBJ := build/spotify.o build/lrc.o
+PLUG_OBJ := $(patsubst src/%.c,build/%.o,$(wildcard src/*.c))
 LRC_OBJ  := $(patsubst %.c,build/%.o,$(wildcard $(LRC)/src/*.c $(LRC)/src/proto/*.c $(LRC)/src/shannon/*.c))
 
 .PHONY: all test install clean
@@ -63,7 +64,12 @@ build/$(LRC)/%.o: $(LRC)/%.c Makefile
 	@mkdir -p $(@D)
 	@$(CC) $(LRC_CFLAGS) -c $< -o $@
 
-test: all
+build/tests/creds: tests/creds_test.c src/creds.c src/creds.h Makefile
+	@mkdir -p $(@D)
+	$(CC) $(PLUG_CFLAGS) -Isrc tests/creds_test.c src/creds.c $(shell pkg-config --libs json-c) -o $@
+
+test: all build/tests/creds
+	@build/tests/creds
 	@$(MAKE) --no-print-directory -C $(MM) build/mediamaster build/mmctl
 	@sh tests/load.sh $(MM)/build build
 
