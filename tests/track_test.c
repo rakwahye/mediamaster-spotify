@@ -61,6 +61,21 @@ static void release(void *arg, int fd, int complete)
 	pthread_mutex_unlock(&lock);
 }
 
+static int frees;
+static pthread_cond_t gate_cond = PTHREAD_COND_INITIALIZER;
+static int gate_open, cancelled, resumes; /* the resumable source, below */
+static size_t resumed_from;
+
+static void count_free(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&lock);
+	frees++;
+	pthread_mutex_unlock(&lock);
+}
+
+static const struct track_io io_plain = { release, NULL, NULL, count_free };
+
 /* A consistent copy of what the callbacks saw. */
 struct seen { int updates, released, complete; uint64_t ms; void *stream; };
 
@@ -78,7 +93,7 @@ static struct seen settle(void)
 {
 	for (int i = 0; i < 200; i++) {
 		struct seen v = seen();
-		if (v.released && v.updates) return v;
+		if (v.complete && v.updates) return v;
 		usleep(5000);
 	}
 	return seen();
@@ -88,6 +103,8 @@ static void reset(void)
 {
 	pthread_mutex_lock(&lock);
 	updates = released = released_complete = read_started = 0;
+	frees = gate_open = cancelled = resumes = 0;
+	resumed_from = 0;
 	updated_ms = 0;
 	updated_stream = NULL;
 	pthread_mutex_unlock(&lock);
@@ -100,6 +117,7 @@ static size_t file_len;
 
 struct writer {
 	int fd;
+	size_t start;    /* first byte to send */
 	size_t stop_at;  /* bytes to send before pausing forever (until closed) */
 	long delay_us;   /* between 16 KiB chunks */
 	int close_at_end;
@@ -109,7 +127,7 @@ struct writer {
 static void *write_file(void *arg)
 {
 	struct writer *w = arg;
-	size_t pos = 0;
+	size_t pos = w->start;
 	while (pos < w->stop_at) {
 		size_t n = w->stop_at - pos < 16384 ? w->stop_at - pos : 16384;
 		ssize_t r = write(w->fd, file + pos, n);
@@ -131,6 +149,7 @@ static int feed_start(struct writer *w, size_t stop_at, long delay_us)
 	if (pipe2(p, O_CLOEXEC) != 0) return -1;
 	fcntl(p[0], F_SETFL, O_NONBLOCK);
 	w->fd = p[1];
+	w->start = 0;
 	w->stop_at = stop_at;
 	w->delay_us = delay_us;
 	w->close_at_end = stop_at == file_len;
@@ -145,12 +164,67 @@ static int feed_start_open(struct writer *w)
 	if (pipe2(p, O_CLOEXEC) != 0) return -1;
 	fcntl(p[0], F_SETFL, O_NONBLOCK);
 	w->fd = p[1];
+	w->start = 0;
 	w->stop_at = file_len;
 	w->delay_us = 0;
 	w->close_at_end = 0;
 	pthread_create(&w->th, NULL, write_file, w);
 	return p[0];
 }
+
+/* A resumable source: resume waits for the gate (the channel coming
+ * free), then delivers the rest of the file from `from`. */
+static struct writer rest;
+
+static int fake_resume(void *arg, size_t from)
+{
+	(void)arg;
+	pthread_mutex_lock(&lock);
+	resumes++;
+	resumed_from = from;
+	while (!gate_open && !cancelled) pthread_cond_wait(&gate_cond, &lock);
+	int go = !cancelled;
+	pthread_mutex_unlock(&lock);
+	if (!go) return -1;
+	int p[2];
+	if (pipe2(p, O_CLOEXEC) != 0) return -1;
+	fcntl(p[0], F_SETFL, O_NONBLOCK);
+	rest.fd = p[1];
+	rest.start = from;
+	rest.stop_at = file_len;
+	rest.delay_us = 0;
+	rest.close_at_end = 1;
+	pthread_create(&rest.th, NULL, write_file, &rest);
+	return p[0];
+}
+
+static void fake_cancel(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&lock);
+	cancelled = 1;
+	pthread_cond_broadcast(&gate_cond);
+	pthread_mutex_unlock(&lock);
+}
+
+static void gate(int open)
+{
+	pthread_mutex_lock(&lock);
+	gate_open = open;
+	pthread_cond_broadcast(&gate_cond);
+	pthread_mutex_unlock(&lock);
+}
+
+static int resumes_now(size_t *from)
+{
+	pthread_mutex_lock(&lock);
+	int n = resumes;
+	if (from) *from = resumed_from;
+	pthread_mutex_unlock(&lock);
+	return n;
+}
+
+static const struct track_io io_resumable = { release, fake_resume, fake_cancel, count_free };
 
 static long drain(struct track *t, int note_read)
 {
@@ -186,7 +260,7 @@ int main(int argc, char **argv)
 
 	/* 1. A whole track, slower than decoding: every frame, then the length. */
 	reset();
-	struct track_src src = { feed_start(&w, file_len, 50000), file_len, release, NULL };
+	struct track_src src = { feed_start(&w, file_len, 50000), file_len, &io_plain, NULL };
 	t = track_open(&host, "full", ffmpeg, &src);
 	CHECK(t, "open");
 	long frames = drain(t, 1);
@@ -244,8 +318,8 @@ int main(int argc, char **argv)
 	CHECK(v.released == 1 && v.complete == 0, "released, incomplete");
 	CHECK(v.updates == 0, "no length for a cut track");
 	track_close(t);
+	pthread_join(w.th, NULL); /* the reader is gone: the writer stops */
 	close(w.fd);
-	pthread_join(w.th, NULL);
 
 	/* 5. Close mid-download, mid-decode. */
 	reset();
@@ -256,10 +330,59 @@ int main(int argc, char **argv)
 	track_close(t);
 	v = seen();
 	CHECK(v.released == 1 && v.complete == 0 && v.updates == 0, "released on close");
+	pthread_join(w.th, NULL); /* the reader is gone: the writer stops */
 	close(w.fd);
-	pthread_join(w.th, NULL);
 
-	/* 6. A sender that never closes: the expected size completes it. */
+	/* 6. Cut, then resumed where it stopped: the whole track plays. */
+	reset();
+	struct track_src rsrc = { feed_start(&w, file_len / 3, 0), file_len, &io_resumable, NULL };
+	t = track_open(&host, "resume", ffmpeg, &rsrc);
+	CHECK(t, "open");
+	CHECK(track_read(t, pcm, 1024) > 0, "playing");
+	track_cut(t);
+	for (int i = 0; i < 200 && !resumes_now(NULL); i++) usleep(5000);
+	size_t from;
+	CHECK(resumes_now(&from) == 1 && from == file_len / 3, "waits to resume at the byte it stopped");
+	v = seen();
+	CHECK(v.released == 1 && v.complete == 0, "the cut fd released first");
+	gate(1);
+	frames = drain(t, 1) + 1024;
+	v = settle();
+	CHECK(frames > want_frames - 2000 && frames < want_frames + 2000, "every frame, across the gap");
+	CHECK(v.released == 2 && v.complete == 1, "resumed fd released, complete");
+	CHECK(v.updates == 1 && v.ms == want_ms, "exact length after a resume");
+	track_close(t);
+	CHECK(frees == 1, "freed once");
+	pthread_join(w.th, NULL); /* the reader is gone: the writer stops */
+	close(w.fd);
+	pthread_join(rest.th, NULL);
+
+	/* 7. Closed while waiting to resume: the wait ends, nothing resumes. */
+	reset();
+	rsrc.fd = feed_start(&w, file_len / 3, 0);
+	t = track_open(&host, "cancel", ffmpeg, &rsrc);
+	CHECK(t, "open");
+	CHECK(track_read(t, pcm, 1024) > 0, "playing");
+	track_cut(t);
+	for (int i = 0; i < 200 && !resumes_now(NULL); i++) usleep(5000);
+	CHECK(resumes_now(NULL) == 1, "waiting to resume");
+	track_close(t);
+	v = seen();
+	CHECK(v.released == 1 && v.updates == 0 && frees == 1, "closed cleanly, freed once");
+	pthread_join(w.th, NULL); /* the reader is gone: the writer stops */
+	close(w.fd);
+
+	/* 8. Closed mid-download with resume on offer: no resume attempt. */
+	reset();
+	rsrc.fd = feed_start(&w, file_len / 3, 0);
+	t = track_open(&host, "closing", ffmpeg, &rsrc);
+	CHECK(t, "open");
+	track_close(t);
+	CHECK(resumes_now(NULL) <= 1 && seen().released == 1 && frees == 1, "close wins over resume");
+	pthread_join(w.th, NULL); /* the reader is gone: the writer stops */
+	close(w.fd);
+
+	/* 9. A sender that never closes: the expected size completes it. */
 	reset();
 	src.fd = feed_start_open(&w);
 	t = track_open(&host, "noeof", ffmpeg, &src);
@@ -272,13 +395,13 @@ int main(int argc, char **argv)
 	pthread_join(w.th, NULL);
 	close(w.fd);
 
-	/* 7. No decoder: open fails and leaves the fd to the caller. */
+	/* 10. No decoder: open fails and leaves the fd to the caller. */
 	reset();
 	int p[2];
 	CHECK(pipe(p) == 0, "pipe");
-	struct track_src none = { p[0], 0, release, NULL };
+	struct track_src none = { p[0], 0, &io_plain, NULL };
 	CHECK(!track_open(&host, "nodecoder", "/nonexistent/ffmpeg", &none), "no ffmpeg");
-	CHECK(seen().released == 0 && fcntl(p[0], F_GETFD) >= 0, "fd untouched");
+	CHECK(seen().released == 0 && frees == 0 && fcntl(p[0], F_GETFD) >= 0, "fd and arg untouched");
 	close(p[0]);
 	close(p[1]);
 

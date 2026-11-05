@@ -4,7 +4,8 @@
  *
  * Three threads touch a track:
  *   download  fd → buf, indexing pages as they complete, until the
- *             expected size or EOF
+ *             expected size or EOF; when cut, waits in io->resume and
+ *             carries on from where it stopped
  *   feed      buf → ffmpeg's stdin, waiting for the download when caught up
  *   host      ffmpeg's stdout → read(); interrupt and close
  * `lock` guards buf, have, done, cut and the report flags; `more` is
@@ -46,6 +47,7 @@ struct track {
 	size_t cap, have;
 	struct ogg_index ix;
 	int done;              /* download over: complete, failed or cut */
+	int closing;           /* track_close has begun */
 	int stopping;          /* track_close: feeder must quit */
 	int reading;           /* the host has called read() */
 	int report;            /* 1: info ready to report, 2: reported */
@@ -148,35 +150,32 @@ static int reserve(struct track *t, size_t n)
 	return 0;
 }
 
-static void *download(void *arg)
-{
-	struct track *t = arg;
-	uint8_t chunk[READ_CHUNK];
-	int complete = 0;
-	const char *why = NULL;
+enum fetched { FETCH_ALL, FETCH_CUT, FETCH_FAILED };
 
+/* Read fd into buf until the end, a cut or an error. */
+static enum fetched fetch(struct track *t, int fd, const char **why)
+{
+	uint8_t chunk[READ_CHUNK];
 	for (;;) {
-		struct pollfd pf[2] = { { t->src.fd, POLLIN, 0 }, { t->cut[0], POLLIN, 0 } };
+		struct pollfd pf[2] = { { fd, POLLIN, 0 }, { t->cut[0], POLLIN, 0 } };
 		if (poll(pf, 2, -1) < 0) {
 			if (errno == EINTR) continue;
-			why = strerror(errno);
-			break;
+			*why = strerror(errno);
+			return FETCH_FAILED;
 		}
 		if (pf[1].revents) {
-			why = "cut short";
-			break;
+			char b[16];
+			while (read(t->cut[0], b, sizeof(b)) > 0) { }
+			return FETCH_CUT;
 		}
 		if (!pf[0].revents) continue;
-		ssize_t r = read(t->src.fd, chunk, sizeof(chunk));
+		ssize_t r = read(fd, chunk, sizeof(chunk));
 		if (r < 0) {
 			if (errno == EINTR || errno == EAGAIN) continue;
-			why = strerror(errno);
-			break;
+			*why = strerror(errno);
+			return FETCH_FAILED;
 		}
-		if (r == 0) {
-			complete = 1;
-			break;
-		}
+		if (r == 0) return FETCH_ALL;
 		pthread_mutex_lock(&t->lock);
 		int bad = reserve(t, (size_t)r);
 		if (!bad) {
@@ -185,20 +184,49 @@ static void *download(void *arg)
 			bad = ogg_index_scan(&t->ix, t->buf, t->have);
 			pthread_cond_broadcast(&t->more);
 		}
-		complete = t->src.size && t->have >= t->src.size;
+		int all = t->src.size && t->have >= t->src.size;
 		pthread_mutex_unlock(&t->lock);
 		if (bad) {
-			why = "out of memory";
+			*why = "out of memory";
+			return FETCH_FAILED;
+		}
+		if (all) return FETCH_ALL; /* the sender need not close to say so */
+	}
+}
+
+static size_t have_now(struct track *t)
+{
+	pthread_mutex_lock(&t->lock);
+	size_t have = t->have;
+	pthread_mutex_unlock(&t->lock);
+	return have;
+}
+
+static void *download(void *arg)
+{
+	struct track *t = arg;
+	const struct track_io *io = t->src.io;
+	const char *why = "cut short";
+	int fd = t->src.fd;
+	enum fetched got;
+
+	for (;;) {
+		got = fetch(t, fd, &why);
+		io->release(t->src.arg, fd, got == FETCH_ALL);
+		if (got != FETCH_CUT || !io->resume) break;
+
+		size_t from = have_now(t);
+		t->h->log(t->h, MM_LOG_DEBUG, "%s: download paused at %zu bytes", t->name, from);
+		if ((fd = io->resume(t->src.arg, from)) < 0) {
+			why = "not resumed";
 			break;
 		}
-		if (complete) break; /* the sender need not close to say so */
+		t->h->log(t->h, MM_LOG_DEBUG, "%s: download resumed at %zu bytes", t->name, from);
 	}
-
-	t->src.release(t->src.arg, t->src.fd, complete);
 
 	pthread_mutex_lock(&t->lock);
 	t->done = 1;
-	if (complete) {
+	if (got == FETCH_ALL) {
 		t->info.duration_ms = ogg_index_duration_ms(&t->ix);
 		t->info.flags = 0;
 		t->report = 1;
@@ -206,12 +234,13 @@ static void *download(void *arg)
 	int send = report_due(t);
 	pthread_cond_broadcast(&t->more);
 	size_t have = t->have;
+	int closing = t->closing;
 	pthread_mutex_unlock(&t->lock);
 
-	if (complete)
+	if (got == FETCH_ALL)
 		t->h->log(t->h, MM_LOG_DEBUG, "%s: downloaded %zu bytes, %llu ms", t->name, have,
 		          (unsigned long long)t->info.duration_ms);
-	else
+	else if (!closing)
 		t->h->log(t->h, MM_LOG_INFO, "%s: download %s after %zu bytes", t->name, why, have);
 	if (send) report(t);
 	return NULL;
@@ -377,6 +406,10 @@ void track_cut(struct track *t)
 
 void track_close(struct track *t)
 {
+	pthread_mutex_lock(&t->lock);
+	t->closing = 1;
+	pthread_mutex_unlock(&t->lock);
+	if (t->src.io->cancel) t->src.io->cancel(t->src.arg);
 	track_cut(t);
 	pthread_join(t->dl, NULL);
 
@@ -394,5 +427,6 @@ void track_close(struct track *t)
 	pthread_mutex_destroy(&t->lock);
 	ogg_index_free(&t->ix);
 	free(t->buf);
+	if (t->src.io->free) t->src.io->free(t->src.arg);
 	free(t);
 }

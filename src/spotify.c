@@ -45,60 +45,123 @@ struct spotify {
 
 /* ------------------------------------------------------------------ channel
  *
- * A session streams one file at a time. The newest open takes the
- * channel: an unfinished download is cut and plays as far as it got.
- * That only ever bites a track being skipped or replaced, since a track
- * still downloading near its end could not have played without gaps
- * anyway. Each holder gets a ticket, so a download that is over before
- * its open returns is not recorded as the owner afterwards. */
+ * A session streams one file at a time, so the files take turns. A new
+ * play goes first: it cuts whatever is downloading. The cut download
+ * waits for the channel to come free, then reopens the file at the byte
+ * where it stopped and carries on. Downloads only wait on each other
+ * when tracks are opened faster than they arrive: skipping, or a play
+ * that fails while another track is still coming in. */
+
+struct fetch {
+	const struct mm_host *h;
+	char uri[64];
+	size_t size;
+	struct track *t; /* NULL until track_open returns */
+	int cancelled;   /* the track is closing: never take the channel again */
+};
 
 static struct {
 	pthread_mutex_t lock;
-	pthread_cond_t freed;
-	int busy;
-	uintptr_t ticket;
-	struct track *owner; /* NULL while the holder is still opening */
-} CH = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, NULL };
+	pthread_cond_t changed;
+	struct fetch *holder;
+	int fresh_waiting; /* new plays waiting: resumes let them go first */
+} CH = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0 };
 
-static uintptr_t channel_take(void)
+static int channel_take(struct fetch *f, int fresh)
 {
 	pthread_mutex_lock(&CH.lock);
-	while (CH.busy) {
-		if (CH.owner) track_cut(CH.owner);
-		pthread_cond_wait(&CH.freed, &CH.lock);
+	if (fresh) CH.fresh_waiting++;
+	for (;;) {
+		if (f->cancelled) break;
+		if (!CH.holder && (fresh || !CH.fresh_waiting)) {
+			CH.holder = f;
+			break;
+		}
+		if (fresh && CH.holder && CH.holder->t) track_cut(CH.holder->t);
+		pthread_cond_wait(&CH.changed, &CH.lock);
 	}
-	CH.busy = 1;
-	CH.owner = NULL;
-	uintptr_t ticket = ++CH.ticket;
+	if (fresh) CH.fresh_waiting--;
+	int ok = CH.holder == f;
 	pthread_mutex_unlock(&CH.lock);
-	return ticket;
+	return ok ? 0 : -1;
 }
 
-static void channel_give(uintptr_t ticket)
+static void channel_give(struct fetch *f)
 {
 	pthread_mutex_lock(&CH.lock);
-	if (CH.busy && CH.ticket == ticket) {
-		CH.busy = 0;
-		CH.owner = NULL;
-		pthread_cond_broadcast(&CH.freed);
+	if (CH.holder == f) {
+		CH.holder = NULL;
+		pthread_cond_broadcast(&CH.changed);
 	}
 	pthread_mutex_unlock(&CH.lock);
 }
 
-static void channel_own(uintptr_t ticket, struct track *t)
+/* Take the channel and start the file streaming from byte `from`.
+ * @returns the fd to read, or -1 (logged) without the channel. */
+static int fetch_start(struct fetch *f, size_t from, int fresh)
 {
-	pthread_mutex_lock(&CH.lock);
-	if (CH.busy && CH.ticket == ticket) CH.owner = t;
-	pthread_mutex_unlock(&CH.lock);
+	const struct mm_host *h = f->h;
+	struct sp_session *ss;
+	struct sp_metadata md;
+	int fd;
+
+	if (channel_take(f, fresh) != 0) return -1;
+	if (!(ss = session_get())) {
+		h->log(h, MM_LOG_WARN, "%s: logged out", f->uri);
+		goto fail;
+	}
+	if ((fd = librespotc_open(f->uri, ss)) < 0) {
+		h->log(h, MM_LOG_WARN, "%s: %s", f->uri, librespotc_last_errmsg());
+		goto fail;
+	}
+	if (fresh) {
+		/* librespot-c does not reliably close the fd at the end, so the
+		 * length is what says the download is complete. */
+		f->size = librespotc_metadata_get(&md, fd) < 0 ? 0 : md.file_len;
+		h->log(h, MM_LOG_DEBUG, "%s: %zu bytes", f->uri, f->size);
+	}
+	if (from && librespotc_seek(fd, from) < 0) {
+		h->log(h, MM_LOG_WARN, "%s: cannot resume at %zu: %s", f->uri, from, librespotc_last_errmsg());
+		librespotc_close(fd);
+		goto fail;
+	}
+	librespotc_write(fd, NULL, NULL);
+	return fd;
+
+fail:
+	channel_give(f);
+	return -1;
 }
 
-/* track_src.release: the download is over. */
-static void release(void *arg, int fd, int complete)
+/* ------------------------------------------------------------------ track_io */
+
+static void io_release(void *arg, int fd, int complete)
 {
 	(void)complete;
 	librespotc_close(fd);
-	channel_give((uintptr_t)arg);
+	channel_give(arg);
 }
+
+static int io_resume(void *arg, size_t from)
+{
+	return fetch_start(arg, from, 0);
+}
+
+static void io_cancel(void *arg)
+{
+	struct fetch *f = arg;
+	pthread_mutex_lock(&CH.lock);
+	f->cancelled = 1;
+	pthread_cond_broadcast(&CH.changed);
+	pthread_mutex_unlock(&CH.lock);
+}
+
+static void io_free(void *arg)
+{
+	free(arg);
+}
+
+static const struct track_io io = { io_release, io_resume, io_cancel, io_free };
 
 /* ------------------------------------------------------------------ source */
 
@@ -108,7 +171,7 @@ static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_
 	const struct mm_host *h = sp->h;
 	char err[512];
 
-	if (strncmp(uri, "spotify:track:", 14) != 0) {
+	if (strncmp(uri, "spotify:track:", 14) != 0 || strlen(uri) >= sizeof(((struct fetch *)0)->uri)) {
 		h->log(h, MM_LOG_WARN, "not a track: %s", uri);
 		return -1;
 	}
@@ -117,28 +180,28 @@ static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_
 		return -1;
 	}
 
-	uintptr_t ticket = channel_take();
-	struct sp_metadata md;
-	int fd = librespotc_open(uri, session_get());
+	struct fetch *f = calloc(1, sizeof(*f));
+	if (!f) return -1;
+	f->h = h;
+	snprintf(f->uri, sizeof(f->uri), "%s", uri);
+	int fd = fetch_start(f, 0, 1);
 	if (fd < 0) {
-		h->log(h, MM_LOG_WARN, "%s: %s", uri, librespotc_last_errmsg());
-		channel_give(ticket);
+		free(f);
 		return -1;
 	}
-	/* librespot-c does not reliably close the fd at the end, so the
-	 * length is what says the download is complete. */
-	if (librespotc_metadata_get(&md, fd) < 0) md.file_len = 0;
-	h->log(h, MM_LOG_DEBUG, "%s: %zu bytes", uri, md.file_len);
-	librespotc_write(fd, NULL, NULL);
 
 	const char *ffmpeg = h->config_get(h, "ffmpeg");
-	struct track_src src = { fd, md.file_len, release, (void *)ticket };
+	struct track_src src = { fd, f->size, &io, f };
 	struct track *t = track_open(h, uri, ffmpeg && *ffmpeg ? ffmpeg : "ffmpeg", &src);
 	if (!t) {
-		release((void *)ticket, fd, 0);
+		io_release(f, fd, 0);
+		free(f);
 		return -1;
 	}
-	channel_own(ticket, t);
+	pthread_mutex_lock(&CH.lock);
+	f->t = t;                              /* now it can be cut */
+	pthread_cond_broadcast(&CH.changed);   /* a waiting play may want to */
+	pthread_mutex_unlock(&CH.lock);
 
 	info->duration_ms = 0; /* known when the download completes */
 	info->flags = 0;
