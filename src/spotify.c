@@ -125,7 +125,10 @@ static int sp_open(void *priv, const char *uri, void **stream, struct mm_stream_
 		channel_give(ticket);
 		return -1;
 	}
+	/* librespot-c does not reliably close the fd at the end, so the
+	 * length is what says the download is complete. */
 	if (librespotc_metadata_get(&md, fd) < 0) md.file_len = 0;
+	h->log(h, MM_LOG_DEBUG, "%s: %zu bytes", uri, md.file_len);
 	librespotc_write(fd, NULL, NULL);
 
 	const char *ffmpeg = h->config_get(h, "ffmpeg");

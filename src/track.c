@@ -3,7 +3,8 @@
  * @brief Download into memory, feed ffmpeg, read PCM.
  *
  * Three threads touch a track:
- *   download  fd → buf, indexing pages as they complete
+ *   download  fd → buf, indexing pages as they complete, until the
+ *             expected size or EOF
  *   feed      buf → ffmpeg's stdin, waiting for the download when caught up
  *   host      ffmpeg's stdout → read(); interrupt and close
  * `lock` guards buf, have, done, cut and the report flags; `more` is
@@ -184,11 +185,13 @@ static void *download(void *arg)
 			bad = ogg_index_scan(&t->ix, t->buf, t->have);
 			pthread_cond_broadcast(&t->more);
 		}
+		complete = t->src.size && t->have >= t->src.size;
 		pthread_mutex_unlock(&t->lock);
 		if (bad) {
 			why = "out of memory";
 			break;
 		}
+		if (complete) break; /* the sender need not close to say so */
 	}
 
 	t->src.release(t->src.arg, t->src.fd, complete);
@@ -279,9 +282,9 @@ struct track *track_open(const struct mm_host *h, const char *name, const char *
 	pthread_mutex_init(&t->lock, NULL);
 	pthread_cond_init(&t->more, NULL);
 
-	if (src->size_hint) {
-		t->buf = malloc(src->size_hint);
-		if (t->buf) t->cap = src->size_hint;
+	if (src->size) {
+		t->buf = malloc(src->size);
+		if (t->buf) t->cap = src->size;
 	}
 	if (pipe2(t->cut, O_CLOEXEC | O_NONBLOCK) != 0 || pipe2(t->wake, O_CLOEXEC | O_NONBLOCK) != 0)
 		goto fail;

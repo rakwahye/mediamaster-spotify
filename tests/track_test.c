@@ -102,6 +102,7 @@ struct writer {
 	int fd;
 	size_t stop_at;  /* bytes to send before pausing forever (until closed) */
 	long delay_us;   /* between 16 KiB chunks */
+	int close_at_end;
 	pthread_t th;
 };
 
@@ -119,7 +120,7 @@ static void *write_file(void *arg)
 			nanosleep(&ts, NULL);
 		}
 	}
-	if (w->stop_at == file_len) close(w->fd);
+	if (w->close_at_end) close(w->fd);
 	return NULL;
 }
 
@@ -132,6 +133,21 @@ static int feed_start(struct writer *w, size_t stop_at, long delay_us)
 	w->fd = p[1];
 	w->stop_at = stop_at;
 	w->delay_us = delay_us;
+	w->close_at_end = stop_at == file_len;
+	pthread_create(&w->th, NULL, write_file, w);
+	return p[0];
+}
+
+/* Everything, then silence with the fd still open. */
+static int feed_start_open(struct writer *w)
+{
+	int p[2];
+	if (pipe2(p, O_CLOEXEC) != 0) return -1;
+	fcntl(p[0], F_SETFL, O_NONBLOCK);
+	w->fd = p[1];
+	w->stop_at = file_len;
+	w->delay_us = 0;
+	w->close_at_end = 0;
 	pthread_create(&w->th, NULL, write_file, w);
 	return p[0];
 }
@@ -185,9 +201,11 @@ int main(int argc, char **argv)
 	v = seen();
 	CHECK(v.released == 1 && v.updates == 1, "close adds nothing");
 
-	/* 2. Downloaded before the first read: the report waits for it. */
+	/* 2. Downloaded before the first read: the report waits for it.
+	 * Size unknown, so EOF is what completes it. */
 	reset();
 	src.fd = feed_start(&w, file_len, 0);
+	src.size = 0;
 	t = track_open(&host, "early", ffmpeg, &src);
 	CHECK(t, "open");
 	pthread_join(w.th, NULL);
@@ -206,6 +224,7 @@ int main(int argc, char **argv)
 
 	/* 3. Interrupt: a blocked read returns 0 at once, then reading goes on. */
 	reset();
+	src.size = file_len;
 	src.fd = feed_start(&w, file_len / 3, 0);
 	t = track_open(&host, "interrupt", ffmpeg, &src);
 	CHECK(t, "open");
@@ -240,7 +259,20 @@ int main(int argc, char **argv)
 	close(w.fd);
 	pthread_join(w.th, NULL);
 
-	/* 6. No decoder: open fails and leaves the fd to the caller. */
+	/* 6. A sender that never closes: the expected size completes it. */
+	reset();
+	src.fd = feed_start_open(&w);
+	t = track_open(&host, "noeof", ffmpeg, &src);
+	CHECK(t, "open");
+	frames = drain(t, 1);
+	v = settle();
+	CHECK(frames > want_frames - 480 && frames < want_frames + 480, "all frames without EOF");
+	CHECK(v.released == 1 && v.complete == 1 && v.updates == 1 && v.ms == want_ms, "complete at the size");
+	track_close(t);
+	pthread_join(w.th, NULL);
+	close(w.fd);
+
+	/* 7. No decoder: open fails and leaves the fd to the caller. */
 	reset();
 	int p[2];
 	CHECK(pipe(p) == 0, "pipe");

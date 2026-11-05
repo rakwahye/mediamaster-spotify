@@ -21,8 +21,9 @@
 struct track;
 
 struct track_src {
-	int fd;           /* read until 0 (complete) or an error */
-	size_t size_hint; /* expected bytes, 0 if unknown */
+	int fd;      /* read until `size` bytes, 0 (EOF) or an error */
+	size_t size; /* bytes the download delivers, 0 if unknown: either
+	              * reaching it or EOF completes the download */
 	/** Called once, from the download thread, when the fd is done with:
 	 * at the end, on error, after track_cut() or during track_close().
 	 * The callee closes fd. */
