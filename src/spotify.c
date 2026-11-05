@@ -26,7 +26,9 @@
 #include "session.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct spotify {
 	const struct mm_host *h;
@@ -41,6 +43,20 @@ static void default_cache(char *out, size_t cap)
 		snprintf(out, cap, "%s/mediamaster/spotify", xdg);
 	else
 		snprintf(out, cap, "%s/.cache/mediamaster/spotify", home ? home : "/tmp");
+}
+
+/* mkdir -p, mode 0700: the cache holds a login. */
+static int mkdir_p(const char *dir)
+{
+	char p[1024];
+	snprintf(p, sizeof(p), "%s", dir);
+	for (char *s = p + 1; *s; s++) {
+		if (*s != '/') continue;
+		*s = '\0';
+		if (mkdir(p, 0700) != 0 && errno != EEXIST) return -1;
+		*s = '/';
+	}
+	return mkdir(p, 0700) != 0 && errno != EEXIST ? -1 : 0;
 }
 
 static int verb_spotify(void *priv, struct mm_verb_ctx *c)
@@ -82,6 +98,11 @@ static int spotify_init(const struct mm_host *h, void **priv)
 	if (cache && *cache) snprintf(sp->cache, sizeof(sp->cache), "%s", cache);
 	else default_cache(sp->cache, sizeof(sp->cache));
 
+	if (mkdir_p(sp->cache) != 0) {
+		h->log(h, MM_LOG_WARN, "cannot create %s: %s", sp->cache, strerror(errno));
+		free(sp);
+		return -1;
+	}
 	if (lrc_start(h, sp->cache) != 0) {
 		free(sp);
 		return -1;

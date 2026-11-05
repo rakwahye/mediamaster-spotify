@@ -19,7 +19,7 @@ exports=$(nm -D --defined-only "$PLUG/spotify.so" | awk '{print $3}')
 
 export MM_SOCK="$T/mm.sock"
 M="$HOST/mmctl"
-C="$T/cache"
+C="$T/xdg/mediamaster/spotify" # parents do not exist yet, like the default
 
 start() {
 	"$HOST/mediamaster" -c /dev/null -o "host.socket=$MM_SOCK" -o "host.plugin_dir=$PLUG" \
@@ -45,6 +45,7 @@ start
 # A stable device id, created once.
 id=$(cat "$C/device_id")
 echo "$id" | grep -qx '[0-9a-f]\{40\}' || fail "device_id: $id"
+[ "$(stat -c %a "$C")" = 700 ] && [ "$(stat -c %a "$C/device_id")" = 600 ] || fail "cache modes: $(stat -c '%a %n' "$C" "$C/device_id")"
 
 # No credentials anywhere: a clear error, no network.
 out=$("$M" spotify login 2>&1) && fail "login without credentials succeeded"

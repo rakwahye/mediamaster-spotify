@@ -5,11 +5,9 @@
 #include "session.h"
 #include "creds.h"
 #include "librespot-c.h"
-#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 static struct {
@@ -21,19 +19,6 @@ static struct {
 	char username[64];
 	char failure[256];    /* last login error, "" if none */
 } S = { .lock = PTHREAD_MUTEX_INITIALIZER };
-
-static int mkdir_p(const char *dir)
-{
-	char p[1024];
-	snprintf(p, sizeof(p), "%s", dir);
-	for (char *s = p + 1; *s; s++) {
-		if (*s != '/') continue;
-		*s = '\0';
-		if (mkdir(p, 0700) != 0 && errno != EEXIST) return -1;
-		*s = '/';
-	}
-	return mkdir(p, 0700) != 0 && errno != EEXIST ? -1 : 0;
-}
 
 void session_setup(const char *cache, const char *import)
 {
@@ -82,7 +67,7 @@ int session_login(char *err, size_t errlen)
 		memcpy(c.blob, fresh.stored_cred, fresh.stored_cred_len);
 		c.blob_len = fresh.stored_cred_len;
 	}
-	if (mkdir_p(S.cache) != 0 || creds_save(S.saved, &c, why, sizeof(why)) != 0)
+	if (creds_save(S.saved, &c, why, sizeof(why)) != 0)
 		snprintf(err, errlen, "logged in, but credentials not saved: %s", why); /* still a success */
 	rc = 0;
 out:

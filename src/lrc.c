@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #define CONNECT_TIMEOUT_MS 5000
@@ -112,11 +111,10 @@ static void device_id(const char *cache, char *out, size_t cap)
 		fclose(f);
 	}
 	for (int i = 0; i < 20; i++) snprintf(out + 2 * i, cap - 2 * (size_t)i, "%02x", raw[i]);
-	mkdir(cache, 0700);
-	f = fopen(path, "w");
-	if (f) {
-		fprintf(f, "%s\n", out);
-		fclose(f);
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd >= 0) {
+		dprintf(fd, "%s\n", out);
+		close(fd);
 	}
 }
 

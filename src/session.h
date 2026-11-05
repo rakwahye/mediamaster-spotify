@@ -16,7 +16,7 @@
 
 struct sp_session;
 
-/** @param cache    directory for credentials.json (created 0700)
+/** @param cache    directory for credentials.json (must exist)
  *  @param import   fallback credentials file, or NULL */
 void session_setup(const char *cache, const char *import);
 
