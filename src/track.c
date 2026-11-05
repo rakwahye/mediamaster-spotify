@@ -214,6 +214,10 @@ static void *download(void *arg)
 		got = fetch(t, fd, &why);
 		io->release(t->src.arg, fd, got == FETCH_ALL);
 		if (got != FETCH_CUT || !io->resume) break;
+		pthread_mutex_lock(&t->lock);
+		int closing = t->closing;
+		pthread_mutex_unlock(&t->lock);
+		if (closing) break;
 
 		size_t from = have_now(t);
 		t->h->log(t->h, MM_LOG_DEBUG, "%s: download paused at %zu bytes", t->name, from);
