@@ -10,8 +10,9 @@
 #
 # Builds against the installed mediamaster SDK (pkg-config mediamaster:
 # mm_plugin.h and the plugin directory), so install mediamaster first. The
-# daemon checks the ABI the plugin was built for when it loads it; after a
-# mediamaster update that changes the ABI, rebuild and reinstall.
+# plugin says which ABI it was built for and the daemon applies the SDK's
+# rule when it loads it (MM_ABI_FITS in mm_plugin.h): a daemon with a newer
+# minor still loads it, a newer major needs a rebuild, which mm-update does.
 #
 # One submodule, pinned to a commit and fetched by `make` when missing:
 #   librespot-c/   Spotify protocol library, compiled into spotify.so

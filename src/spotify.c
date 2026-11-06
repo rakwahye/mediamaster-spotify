@@ -335,9 +335,10 @@ static int sp_radio(void *priv, const struct mm_item *seed, uint32_t flags, mm_i
 	return library_radio(&c, user, seed, flags, emit, ctx, err, errlen);
 }
 
-static const struct mm_catalog_ops catalog = { .list = sp_list, .radio = sp_radio };
+static const struct mm_catalog_ops catalog = { .size = sizeof(struct mm_catalog_ops), .list = sp_list, .radio = sp_radio };
 
 static const struct mm_source_ops source = {
+	.size      = sizeof(struct mm_source_ops),
 	.open      = sp_open,
 	.read      = sp_read,
 	.seek      = sp_seek,
