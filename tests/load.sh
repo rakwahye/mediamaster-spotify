@@ -1,12 +1,11 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-2.1-or-later
-# Load the plugin into the pinned mediamaster and check it comes up.
-# Spotify itself is not needed: login is exercised up to its failure.
-# Usage: tests/load.sh <mediamaster-build-dir> <plugin-build-dir>
+# Load the plugin into the installed mediamaster (from PATH) and check it
+# comes up. Spotify itself is not needed: login is exercised up to its
+# failure. Usage: tests/load.sh <plugin-build-dir>
 set -eu
 
-HOST=$1
-PLUG=$2
+PLUG=$1
 T=$(mktemp -d /tmp/mm-spotify-test.XXXXXX)
 PID=
 cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; rm -rf "$T"; }
@@ -18,11 +17,11 @@ exports=$(nm -D --defined-only "$PLUG/spotify.so" | awk '{print $3}')
 [ "$exports" = mm_plugin_entry ] || { echo "FAIL load: spotify.so exports: $exports" >&2; exit 1; }
 
 export MM_SOCK="$T/mm.sock"
-M="$HOST/mmctl"
+M=mmctl
 C="$T/xdg/mediamaster/spotify" # parents do not exist yet, like the default
 
 start() {
-	"$HOST/mediamaster" -c /dev/null -o "host.socket=$MM_SOCK" -o "host.plugin_dir=$PLUG" \
+	mediamaster -c /dev/null -o "host.socket=$MM_SOCK" -o "host.plugin_dir=$PLUG" \
 		-o host.sink=null -o "spotify.cache=$C" "$@" 2>>"$T/log" &
 	PID=$!
 	i=0

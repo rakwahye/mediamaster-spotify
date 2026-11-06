@@ -3,33 +3,35 @@
 # Spotify plugin for mediamaster.
 #
 #   make              build/spotify.so
-#   make test         load it into the pinned mediamaster and check it
-#   make install      copy it into mediamaster's plugin directory
+#   make test         unit tests, then load it into the installed mediamaster
+#   make install      into mediamaster's plugin directory
 #
-# Two submodules, each pinned to a commit and fetched by `make` when
-# missing:
-#   mediamaster/   the host: include/mm_plugin.h, and the daemon for tests
+# Builds against the installed mediamaster SDK (pkg-config mediamaster:
+# mm_plugin.h and the plugin directory), so install mediamaster first. The
+# daemon checks the ABI the plugin was built for when it loads it; after a
+# mediamaster update that changes the ABI, rebuild and reinstall.
+#
+# One submodule, pinned to a commit and fetched by `make` when missing:
 #   librespot-c/   Spotify protocol library, compiled into spotify.so
-#
-#   make MM=~/src/mediamaster        build against another host checkout
-#   git -C <sub> checkout <rev> && git add <sub>
-#                                     move a pin
+#   git -C librespot-c checkout <rev> && git add librespot-c    moves the pin
 #
 # Needs: libevent json-c libgcrypt libcurl protobuf-c (with headers);
 # ffmpeg with Vorbis to play, and to test.
 
-CC     ?= cc
-MM     ?= mediamaster
-LRC    := librespot-c
-PREFIX ?= /usr/local
-PLUGIN_DIR ?= $(PREFIX)/lib/mediamaster/plugins
+CC  ?= cc
+LRC := librespot-c
 
-# Fetch a submodule before anything below lists its files.
+MM_CFLAGS  := $(shell pkg-config --cflags mediamaster 2>/dev/null)
+PLUGIN_DIR ?= $(shell pkg-config --variable=plugindir mediamaster 2>/dev/null)
+ifeq ($(MM_CFLAGS),)
+  $(error mediamaster is not installed: pkg-config cannot find mediamaster.pc. \
+          Run make install in the mediamaster repository first, or set PKG_CONFIG_PATH)
+endif
+MM_HEADER := $(patsubst -I%,%,$(filter -I%,$(MM_CFLAGS)))/mm_plugin.h
+
+# Fetch the submodule before anything below lists its files.
 fetch = $(if $(wildcard $(1)/$(2)),,$(shell git submodule update --init $(1) >&2))
 $(call fetch,$(LRC),librespot-c.h)
-ifeq ($(MM),mediamaster)
-$(call fetch,$(MM),include/mm_plugin.h)
-endif
 
 PKGS   := libevent json-c libgcrypt libcurl libprotobuf-c
 CFLAGS ?= -O2 -g
@@ -37,7 +39,7 @@ CFLAGS ?= -O2 -g
 # The plugin: strict C99 against the host ABI and librespot-c's header.
 PLUG_CFLAGS := $(CFLAGS) -std=c99 -pedantic -Wall -Wextra -Wshadow \
                -Wstrict-prototypes -Wmissing-prototypes -D_POSIX_C_SOURCE=200809L \
-               -fPIC -fvisibility=hidden -I$(MM)/include -I$(LRC) -I$(LRC)/src \
+               -fPIC -fvisibility=hidden $(MM_CFLAGS) -I$(LRC) -I$(LRC)/src \
                $(shell pkg-config --cflags json-c libcurl libprotobuf-c)
 
 # librespot-c: its own dialect, its warnings are upstream's business.
@@ -54,14 +56,14 @@ LRC_INT_CFLAGS := $(filter-out -w,$(LRC_CFLAGS)) -Wall -Wextra -Wno-unused-param
 PLUG_OBJ := $(patsubst src/%.c,build/%.o,$(wildcard src/*.c src/lrc/*.c))
 LRC_OBJ  := $(patsubst %.c,build/%.o,$(wildcard $(LRC)/src/*.c $(LRC)/src/proto/*.c $(LRC)/src/shannon/*.c))
 
-.PHONY: all test install clean
+.PHONY: all test install uninstall clean
 all: build/spotify.so
 
 build/spotify.so: $(PLUG_OBJ) $(LRC_OBJ)
 	@echo "link $@ (plugin + $(words $(LRC_OBJ)) librespot-c objects)"
 	@$(CC) -shared $(LDFLAGS) $^ $(shell pkg-config --libs $(PKGS)) -pthread -o $@
 
-build/%.o: src/%.c src/*.h $(MM)/include/mm_plugin.h Makefile
+build/%.o: src/%.c src/*.h $(MM_HEADER) Makefile
 	@mkdir -p $(@D)
 	$(CC) $(PLUG_CFLAGS) -c $< -o $@
 
@@ -112,12 +114,15 @@ test: all build/tests/creds build/tests/meta build/tests/library build/tests/ogg
 	@build/tests/library
 	@build/tests/ogg build/tests/noise.ogg $(OGG_MS)
 	@build/tests/track ffmpeg build/tests/noise.ogg $(OGG_MS)
-	@$(MAKE) --no-print-directory -C $(MM) build/mediamaster build/mmctl
-	@sh tests/load.sh $(MM)/build build
+	@if command -v mediamaster >/dev/null && command -v mmctl >/dev/null; then sh tests/load.sh build; \
+	 else echo "load: skipped (mediamaster is not installed, or not in PATH)"; fi
 
 install: all
 	install -d $(DESTDIR)$(PLUGIN_DIR)
 	install -m 644 build/spotify.so $(DESTDIR)$(PLUGIN_DIR)
+
+uninstall:
+	rm -f $(DESTDIR)$(PLUGIN_DIR)/spotify.so
 
 clean:
 	rm -rf build
