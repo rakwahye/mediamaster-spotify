@@ -3,7 +3,9 @@
 # Spotify plugin for mediamaster.
 #
 #   make              build/spotify.so
-#   make test         unit tests, then load it into the installed mediamaster
+#   make test         unit tests; load it into the installed mediamaster; and,
+#                     with a mediamaster checkout beside this one (or at
+#                     $MM_SRC), check that the host's history never names us
 #   make install      into mediamaster's plugin directory
 #
 # Builds against the installed mediamaster SDK (pkg-config mediamaster:
@@ -121,6 +123,7 @@ test: all build/tests/creds build/tests/meta build/tests/library build/tests/ogg
 	@build/tests/track ffmpeg build/tests/noise.ogg $(OGG_MS)
 	@if command -v mediamaster >/dev/null && command -v mmctl >/dev/null; then sh tests/load.sh build; \
 	 else echo "load: skipped (mediamaster is not installed, or not in PATH)"; fi
+	@sh tests/host-clean.sh
 
 install: all
 	install -d $(DESTDIR)$(PLUGIN_DIR)
