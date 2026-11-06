@@ -21,11 +21,16 @@
 CC  ?= cc
 LRC := librespot-c
 
-MM_CFLAGS  := $(shell pkg-config --cflags mediamaster 2>/dev/null)
-PLUGIN_DIR ?= $(shell pkg-config --variable=plugindir mediamaster 2>/dev/null)
+# pkg-config on some distributions (Arch) does not search /usr/local, where
+# mediamaster installs by default. The daemon in PATH says where its SDK is.
+MM_BIN     := $(shell command -v mediamaster 2>/dev/null)
+MM_PC_DIR  := $(if $(MM_BIN),$(abspath $(dir $(MM_BIN))../lib/pkgconfig))
+PKG_CONFIG := PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)$(if $(MM_PC_DIR),:$(MM_PC_DIR))" pkg-config
+MM_CFLAGS  := $(shell $(PKG_CONFIG) --cflags mediamaster 2>/dev/null)
+PLUGIN_DIR ?= $(shell $(PKG_CONFIG) --variable=plugindir mediamaster 2>/dev/null)
 ifeq ($(MM_CFLAGS),)
-  $(error mediamaster is not installed: pkg-config cannot find mediamaster.pc. \
-          Run make install in the mediamaster repository first, or set PKG_CONFIG_PATH)
+  $(error mediamaster is not installed, or not in PATH: pkg-config cannot find mediamaster.pc. \
+          Run make install in the mediamaster repository first, or set PKG_CONFIG_PATH to its lib/pkgconfig)
 endif
 MM_HEADER := $(patsubst -I%,%,$(filter -I%,$(MM_CFLAGS)))/mm_plugin.h
 
